@@ -24,6 +24,7 @@ import {
   extractWaveformPeaks,
   detectVocalStartLocally,
   alignLyricsToAudioAcoustically,
+  alignCuesWithAcousticWaveform,
 } from './utils/audioWaveform';
 import { runLocalWhisperAlignment } from './utils/whisperAligner';
 import { DEMO_TRACKS, synthesizeDemoTrack } from './utils/audioSynthesizer';
@@ -504,7 +505,21 @@ export default function App() {
             );
 
             if (whisperResult.cues.length > 0) {
-              finalCues = whisperResult.cues;
+              // Automatic waveform snapping: tightens cue borders directly onto visible acoustic peaks & valleys
+              try {
+                const arrayBuf = await audioBlob.arrayBuffer();
+                const actx = new (window.AudioContext || (window as any).webkitAudioContext)();
+                const decodedBuf = await actx.decodeAudioData(arrayBuf);
+                await actx.close();
+                const snapped = alignCuesWithAcousticWaveform(
+                  decodedBuf,
+                  whisperResult.cues,
+                  whisperResult.detectedIntroSilence
+                );
+                finalCues = snapped.length > 0 ? snapped : whisperResult.cues;
+              } catch (_) {
+                finalCues = whisperResult.cues;
+              }
               detectedBreaks = whisperResult.detectedBreaks;
               effectiveStart = whisperResult.detectedIntroSilence;
             }
