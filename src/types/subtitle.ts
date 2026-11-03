@@ -27,7 +27,7 @@ export interface SyncProgressState {
   step: number; // 1 to 5
   stepLabel: string;
   progressPercent: number;
-  source?: 'gemini-3.8-flash' | 'cadence-alignment-engine';
+  source?: string;
   isTranslating?: boolean;
 }
 

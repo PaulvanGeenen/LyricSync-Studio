@@ -175,11 +175,12 @@ export default function App() {
     if (audioUrl) {
       URL.revokeObjectURL(audioUrl);
     }
-    const audioEl = document.querySelector('audio');
-    if (audioEl) {
-      audioEl.pause();
-      audioEl.currentTime = 0;
-    }
+    document.querySelectorAll('audio').forEach((el) => {
+      try {
+        el.pause();
+        el.currentTime = 0;
+      } catch (_) {}
+    });
 
     setAudioFile(null);
     setAudioBlob(null);
@@ -318,7 +319,7 @@ export default function App() {
       const data = await res.json();
       if (data.pairs && Array.isArray(data.pairs)) {
         setTranslatedPreviewPairs(data.pairs);
-        showToast('Vertaling met Gemini 3.8 Flash voltooid!', 'success');
+        showToast('Vertaling met Gemini voltooid!', 'success');
       }
     } catch (err: any) {
       console.error('Error during preview translation:', err);
@@ -358,7 +359,7 @@ export default function App() {
       const data = await res.json();
       if (data.pairs && Array.isArray(data.pairs)) {
         setTranslatedPreviewPairs(data.pairs);
-        showToast('Alle vertaalregels zijn gecontroleerd en geoptimaliseerd door Gemini 3.8!', 'success');
+        showToast('Alle vertaalregels zijn gecontroleerd en geoptimaliseerd door Gemini!', 'success');
       }
     } catch (err: any) {
       console.error('Error improving translation:', err);

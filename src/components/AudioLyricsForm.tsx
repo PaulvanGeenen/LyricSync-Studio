@@ -835,7 +835,7 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
                         <Sparkles className="w-3.5 h-3.5" />
                         <span>Vertaling</span>
                         <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono">
-                          Gemini 3.8 Flash
+                          Gemini Flash
                         </span>
                       </span>
                     </div>
@@ -847,7 +847,7 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
                         onClick={() => onImproveTranslation(feedbackNote || undefined)}
                         disabled={isImprovingTranslation || isTranslatingPreview}
                         className="px-2.5 py-1 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-semibold rounded text-xs transition-all flex items-center gap-1.5 shadow-sm disabled:opacity-50"
-                        title="Laat Gemini 3.8 alle regels controleren op taalfouten, onnatuurlijk Nederlands en houterige formuleringen"
+                        title="Laat Gemini alle regels controleren op taalfouten, onnatuurlijk Nederlands en houterige formuleringen"
                       >
                         {isImprovingTranslation ? (
                           <>
@@ -876,7 +876,7 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
                         onClick={onTranslatePreview}
                         disabled={isTranslatingPreview || isImprovingTranslation}
                         className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs transition-colors flex items-center gap-1 border border-slate-700"
-                        title="Vertaal opnieuw met Gemini 3.8"
+                        title="Vertaal opnieuw met Gemini"
                       >
                         <RefreshCw className={`w-3 h-3 ${isTranslatingPreview ? 'animate-spin text-amber-400' : 'text-slate-400'}`} />
                         <span>Opnieuw</span>
@@ -1057,7 +1057,7 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
                     {isTranslatingPreview ? (
                       <>
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>Vertalen met Gemini 3.8 Flash...</span>
+                        <span>Vertalen met Gemini...</span>
                       </>
                     ) : (
                       <>

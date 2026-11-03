@@ -19,13 +19,27 @@ const __dirname = path.dirname(__filename);
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = Number(process.env.PORT) || 3000;
 
-// Resilient pool of Gemini models: gemini-3-flash-preview is active and robust against 503 spikes
+// Resilient pool of official Google Gemini models
 const CANDIDATE_MODELS = [
-  'gemini-3.1-flash-lite',
-  'gemini-3-flash-preview',
-  'gemini-3.8-flash',
-  'gemini-flash-latest',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
 ];
+
+let _ffmpegChecked = false;
+let _ffmpegAvailable = false;
+
+async function checkFfmpegAvailable(): Promise<boolean> {
+  if (_ffmpegChecked) return _ffmpegAvailable;
+  try {
+    await execFileAsync('ffmpeg', ['-version'], { timeout: 3000 });
+    _ffmpegAvailable = true;
+  } catch {
+    _ffmpegAvailable = false;
+  }
+  _ffmpegChecked = true;
+  return _ffmpegAvailable;
+}
 
 /**
  * Strips bracketed section headers like [Verse 1], [Chorus], [Bridge], [Intro], [Outro], etc.
@@ -115,6 +129,16 @@ async function processAudioForAiAndAcoustics(
   audioBase64: string,
   mimeType: string
 ): Promise<ProcessedAudioResult> {
+  const hasFfmpeg = await checkFfmpegAvailable();
+  if (!hasFfmpeg) {
+    return {
+      base64: audioBase64,
+      mimeType,
+      detectedIntroSilence: 0,
+      detectedBreaks: [],
+    };
+  }
+
   let tmpInput = '';
   let tmpOutput = '';
   let detectedIntroSilence = 0;
@@ -1197,6 +1221,13 @@ CRITICAL RULES:
 
   // Convert MP3 + JPG to MP4 video with optional burned-in subtitles using FFmpeg
   app.post('/api/convert-mp3-to-mp4', async (req, res) => {
+    const hasFfmpeg = await checkFfmpegAvailable();
+    if (!hasFfmpeg) {
+      return res.status(503).json({
+        error: 'FFmpeg is niet geïnstalleerd of niet gevonden in het PATH. Installeer FFmpeg (bijvoorbeeld in PowerShell via: winget install Gyan.FFmpeg) om MP4-video\'s te kunnen renderen.',
+      });
+    }
+
     let tmpDir = '';
     try {
       const {

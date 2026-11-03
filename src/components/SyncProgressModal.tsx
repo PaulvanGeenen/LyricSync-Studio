@@ -49,7 +49,7 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
         {
           id: 3,
           title: 'Multimodale AI-Tijduitlijning',
-          desc: 'Zanginzetten en fraselabs synchroniseren met Gemini 3.8 Flash',
+          desc: 'Zanginzetten en fraselabs synchroniseren met Gemini AI',
           icon: Cpu,
         },
         {
@@ -75,7 +75,7 @@ export const SyncProgressModal: React.FC<SyncProgressModalProps> = ({
         {
           id: 3,
           title: 'AI Temporal Alignment',
-          desc: 'Synchronizing vocal onsets and phrase boundaries with Gemini 3.8 Flash',
+          desc: 'Synchronizing vocal onsets and phrase boundaries with Gemini AI',
           icon: Cpu,
         },
         {
