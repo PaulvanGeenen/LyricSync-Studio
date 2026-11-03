@@ -1386,7 +1386,10 @@ CRITICAL RULES:
   // Vite middleware or static dist handling
   if (!isProduction) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: { port: 24680 },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
