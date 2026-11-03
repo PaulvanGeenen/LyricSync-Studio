@@ -145,12 +145,16 @@ export function alignWhisperWordsToLyricLines(
     let bestStartIdx = -1;
     let bestEndIdx = -1;
     let bestScore = -1;
+    let bestFirstMatchedTargetIdx = 0;
+    let bestLastMatchedTargetIdx = 0;
 
     // Try finding the match of targetWords sequence starting at various positions in Whisper words
     for (let wStart = curWordIdx; wStart < searchWindow; wStart++) {
       let matchedCount = 0;
       let scoreSum = 0;
       let wPtr = wStart;
+      let firstMatchedT = -1;
+      let lastMatchedT = -1;
 
       for (let t = 0; t < targetWords.length && wPtr < searchWindow; t++) {
         const target = targetWords[t];
@@ -162,13 +166,12 @@ export function alignWhisperWordsToLyricLines(
           if (sim >= 0.6) {
             matchedCount++;
             scoreSum += sim;
+            if (firstMatchedT === -1) firstMatchedT = t;
+            lastMatchedT = t;
             wPtr = wPtr + lookahead + 1;
             foundWordInScan = true;
             break;
           }
-        }
-        if (!foundWordInScan) {
-          // If word wasn't found, continue to next target word
         }
       }
 
@@ -177,12 +180,28 @@ export function alignWhisperWordsToLyricLines(
         bestScore = scoreSum;
         bestStartIdx = wStart;
         bestEndIdx = Math.max(wStart, wPtr - 1);
+        bestFirstMatchedTargetIdx = firstMatchedT >= 0 ? firstMatchedT : 0;
+        bestLastMatchedTargetIdx = lastMatchedT >= 0 ? lastMatchedT : targetWords.length - 1;
       }
     }
 
     if (bestStartIdx >= 0 && bestEndIdx >= bestStartIdx) {
-      const startTime = Math.round(validWords[bestStartIdx].start * 100) / 100;
-      const endTime = Math.round((validWords[bestEndIdx].end + 0.25) * 100) / 100;
+      let startTime = Math.round(validWords[bestStartIdx].start * 100) / 100;
+      let endTime = Math.round((validWords[bestEndIdx].end + 0.25) * 100) / 100;
+
+      // Expand backwards if leading words were missed (e.g. "The paso doble" missed before "strikes")
+      if (bestFirstMatchedTargetIdx > 0) {
+        const estimatedPreRoll = bestFirstMatchedTargetIdx * 0.45;
+        startTime = Math.max(0, Math.round((startTime - estimatedPreRoll) * 100) / 100);
+      }
+
+      // Expand forwards if trailing words were missed
+      const missingTrailing = (targetWords.length - 1) - bestLastMatchedTargetIdx;
+      if (missingTrailing > 0) {
+        const estimatedPostRoll = missingTrailing * 0.40;
+        endTime = Math.round((endTime + estimatedPostRoll) * 100) / 100;
+      }
+
       spans.push({
         id: lineObj.id,
         text: lineObj.text,

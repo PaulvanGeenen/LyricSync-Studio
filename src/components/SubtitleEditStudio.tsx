@@ -1389,7 +1389,7 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
               const nextCue = cues[idx + 1];
               if (!nextCue) return null;
               const gap = nextCue.startTime - cue.endTime;
-              if (gap < 3.2) return null;
+              if (gap < 6.5) return null;
               const breakLeft = cue.endTime * pixelsPerSecond;
               const breakWidth = gap * pixelsPerSecond;
               return (
