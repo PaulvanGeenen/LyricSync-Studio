@@ -1,0 +1,6 @@
+{
+  "name": "LyricSync Studio",
+  "description": "Upload music and song lyrics to automatically generate, preview, edit, and export synchronized subtitles in Dutch and English as SRT or VTT files.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

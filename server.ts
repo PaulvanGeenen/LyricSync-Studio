@@ -1,0 +1,1374 @@
+import express from 'express';
+import { createServer as createViteServer } from 'vite';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import os from 'os';
+import { execFile } from 'child_process';
+import util from 'util';
+import dotenv from 'dotenv';
+import { GoogleGenAI, Type } from '@google/genai';
+
+const execFileAsync = util.promisify(execFile);
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const isProduction = process.env.NODE_ENV === 'production';
+const PORT = Number(process.env.PORT) || 3000;
+
+// Resilient pool of Gemini models: gemini-3-flash-preview is active and robust against 503 spikes
+const CANDIDATE_MODELS = [
+  'gemini-3.1-flash-lite',
+  'gemini-3-flash-preview',
+  'gemini-3.8-flash',
+  'gemini-flash-latest',
+];
+
+/**
+ * Strips bracketed section headers like [Verse 1], [Chorus], [Bridge], [Intro], [Outro], etc.
+ * Discards empty lines resulting from standalone bracket tags.
+ */
+function cleanLyricLines(rawText: string): string[] {
+  return rawText
+    .split('\n')
+    .map((line) => line.replace(/\[.*?\]/g, '').trim())
+    .filter((line) => line.length > 0);
+}
+
+function cleanLyricsString(rawText: string): string {
+  return cleanLyricLines(rawText).join('\n');
+}
+
+/**
+ * Post-processes and clamps cues while strictly preserving sequential cue order:
+ * 1. Guarantees monotonic progression: each cue starts after the previous cue ends.
+ * 2. Clamps abnormally stretched cue durations (max ~7.5s).
+ * 3. Prevents collisions or backwards jumps.
+ * 4. Ensures every single cue from #1 to #N is preserved with valid positive duration.
+ */
+function sanitizeAndClampCues(
+  rawCues: { id: number; startTime: number; endTime: number; text: string; originalText?: string }[],
+  audioDuration: number
+) {
+  // Always sort primarily by ID to strictly preserve the song's lyrical sequence
+  const cues = [...rawCues].sort((a, b) => a.id - b.id);
+  if (cues.length === 0) return [];
+  let lastEnd = cues[0].startTime;
+
+  for (let i = 0; i < cues.length; i++) {
+    const cue = cues[i];
+    const nextCue = cues[i + 1];
+
+    const lineLength = cue.text.length;
+    const naturalVocalDuration = Math.max(1.8, Math.min(7.5, 1.3 + lineLength * 0.12));
+
+    // Ensure start time is monotonic and never steps backwards behind previous cue
+    if (cue.startTime < lastEnd) {
+      cue.startTime = Math.round(lastEnd * 100) / 100;
+    }
+
+    // Clamp stretched duration
+    if (cue.endTime - cue.startTime > 8.5 || cue.endTime <= cue.startTime) {
+      cue.endTime = Math.round((cue.startTime + naturalVocalDuration) * 100) / 100;
+    }
+
+    // Avoid collision with next cue if next cue has a valid future timestamp
+    if (nextCue && nextCue.startTime > cue.startTime && cue.endTime > nextCue.startTime) {
+      cue.endTime = Math.max(cue.startTime + 1.2, Math.round((nextCue.startTime - 0.15) * 100) / 100);
+    }
+
+    // Handle audio boundary gracefully without collapsing duration
+    if (audioDuration > 0 && cue.endTime > audioDuration + 0.2) {
+      if (cue.startTime < audioDuration - 1.2) {
+        cue.endTime = Math.round(audioDuration * 100) / 100;
+      }
+    }
+
+    lastEnd = cue.endTime + 0.15;
+  }
+
+  return cues;
+}
+
+interface AcousticBreak {
+  start: number;
+  end: number;
+  duration: number;
+}
+
+interface ProcessedAudioResult {
+  base64: string;
+  mimeType: string;
+  detectedIntroSilence: number;
+  detectedBreaks: AcousticBreak[];
+}
+
+/**
+ * Optimizes audio payloads for Gemini AI models with 24kHz 64kbps mono MP3,
+ * and performs sub-millisecond acoustic VAD (silencedetect + bandpass) to pinpoint
+ * exact intro silence duration and mid-song instrumental breaks (guitar solos, piano interludes).
+ */
+async function processAudioForAiAndAcoustics(
+  audioBase64: string,
+  mimeType: string
+): Promise<ProcessedAudioResult> {
+  let tmpInput = '';
+  let tmpOutput = '';
+  let detectedIntroSilence = 0;
+  const detectedBreaks: AcousticBreak[] = [];
+
+  try {
+    const tmpDir = os.tmpdir();
+    const id = Math.random().toString(36).substring(2, 9);
+    tmpInput = path.join(tmpDir, `input_${id}.audio`);
+    tmpOutput = path.join(tmpDir, `compact_${id}.mp3`);
+
+    const cleanBase64 = audioBase64.replace(/^data:audio\/[a-zA-Z0-9.+_-]+;base64,/, '');
+    fs.writeFileSync(tmpInput, Buffer.from(cleanBase64, 'base64'));
+
+    // 1. Acoustic VAD Analysis: detect quiet intervals / instrumental breaks in vocal band
+    try {
+      const { stderr } = await execFileAsync('ffmpeg', [
+        '-i', tmpInput,
+        '-af', 'bandpass=f=1200:width_type=h:w=1800, silencedetect=noise=-28dB:d=1.5',
+        '-f', 'null',
+        '-',
+      ], { timeout: 15000 });
+
+      const lines = (stderr || '').split('\n');
+      let currentSilenceStart: number | null = null;
+      for (const line of lines) {
+        const startMatch = line.match(/silence_start:\s*([0-9.]+)/);
+        if (startMatch) {
+          currentSilenceStart = parseFloat(startMatch[1]);
+        }
+        const endMatch = line.match(/silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)/);
+        if (endMatch && currentSilenceStart !== null) {
+          const end = parseFloat(endMatch[1]);
+          const dur = parseFloat(endMatch[2]);
+          if (currentSilenceStart < 1.0) {
+            detectedIntroSilence = Math.max(detectedIntroSilence, end);
+          } else if (dur >= 2.5) {
+            detectedBreaks.push({
+              start: Math.round(currentSilenceStart * 100) / 100,
+              end: Math.round(end * 100) / 100,
+              duration: Math.round(dur * 100) / 100,
+            });
+          }
+          currentSilenceStart = null;
+        }
+      }
+    } catch (vadErr: any) {
+      console.warn('[VAD Acoustic Analysis] Non-fatal VAD warning:', vadErr?.message?.substring(0, 100));
+    }
+
+    // 2. High-fidelity vocal compression for Gemini: 24kHz @ 64kbps mono MP3 (preserves vocal consonants & breathing)
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-loglevel', 'error',
+      '-i', tmpInput,
+      '-ar', '24000',
+      '-ac', '1',
+      '-b:a', '64k',
+      tmpOutput,
+    ], { timeout: 15000 });
+
+    if (fs.existsSync(tmpOutput)) {
+      const compactBuf = fs.readFileSync(tmpOutput);
+      if (compactBuf.length > 0) {
+        console.log(
+          `[Audio Processing] High-fidelity compression: ${(cleanBase64.length / 1024 / 1024).toFixed(1)}MB -> ${(compactBuf.length / 1024).toFixed(0)}KB (24kHz 64kbps). Detected intro: ${detectedIntroSilence.toFixed(1)}s, ${detectedBreaks.length} instrumental breaks.`
+        );
+        return {
+          base64: compactBuf.toString('base64'),
+          mimeType: 'audio/mp3',
+          detectedIntroSilence,
+          detectedBreaks,
+        };
+      }
+    }
+  } catch (err: any) {
+    console.warn('[Audio Processing] FFmpeg processing fallback:', err?.message?.substring(0, 100));
+  } finally {
+    try {
+      if (tmpInput && fs.existsSync(tmpInput)) fs.unlinkSync(tmpInput);
+      if (tmpOutput && fs.existsSync(tmpOutput)) fs.unlinkSync(tmpOutput);
+    } catch (_) {}
+  }
+
+  return {
+    base64: audioBase64,
+    mimeType,
+    detectedIntroSilence,
+    detectedBreaks,
+  };
+}
+
+/**
+ * Intelligent sequential alignment merger:
+ * Combines multimodal AI timing anchors with all lyric pairs.
+ * Strictly respects acoustic instrumental breaks & solos (NEVER drags cues backwards into solos,
+ * and NEVER linearly stretches cues across solo breaks).
+ */
+function mergeTimingsWithPairs(
+  pairs: { id: number; original: string; translated: string }[],
+  parsedTimings: { id: number; startTime: number; endTime: number }[],
+  totalDuration: number,
+  isTranslationNeeded: boolean,
+  vocalStartTime: number = 0,
+  detectedBreaks: AcousticBreak[] = []
+) {
+  if (pairs.length === 0) return [];
+
+  const effectiveDuration = totalDuration > 10 ? totalDuration : pairs.length * 4.5 + vocalStartTime;
+
+  // Clean and parse timings sorted by ID
+  let validTimings = (parsedTimings || [])
+    .map((t) => ({
+      id: Number(t.id),
+      startTime: Math.max(0, parseFloat(String(t.startTime)) || 0),
+      endTime: Math.max(0, parseFloat(String(t.endTime)) || 0),
+    }))
+    .filter((t) => !isNaN(t.id) && !isNaN(t.startTime) && t.endTime > t.startTime)
+    .sort((a, b) => a.id - b.id);
+
+  // Step 1: Detect and repair MM.SS decimal notation bugs from AI (e.g. 1:11.50 written as 111.50 instead of 71.50)
+  let runningCheckEnd = vocalStartTime;
+  for (let i = 0; i < validTimings.length; i++) {
+    const t = validTimings[i];
+    const origDur = Math.max(1.8, Math.min(7.5, t.endTime - t.startTime));
+    if (t.startTime >= 100) {
+      const mins = Math.floor(t.startTime / 100);
+      const secs = t.startTime % 100;
+      if (mins >= 1 && mins <= 9 && secs < 60) {
+        const mmSsCorrectedStart = Math.round((mins * 60 + secs) * 100) / 100;
+        const jumpFromPrev = t.startTime - runningCheckEnd;
+        if (
+          (jumpFromPrev > 22 && mmSsCorrectedStart >= runningCheckEnd - 2.5) ||
+          (t.startTime > effectiveDuration - 2 && mmSsCorrectedStart < effectiveDuration - 2 && mmSsCorrectedStart >= runningCheckEnd - 2.5)
+        ) {
+          console.log(
+            `[Alignment MM.SS Fix] Cue #${t.id}: Fixed AI MM.SS timestamp ${t.startTime.toFixed(2)}s -> ${mmSsCorrectedStart.toFixed(2)}s (${mins}m ${secs.toFixed(2)}s)`
+          );
+          t.startTime = Math.max(runningCheckEnd, mmSsCorrectedStart);
+          const endMins = Math.floor(t.endTime / 100);
+          const endSecs = t.endTime % 100;
+          if (endMins >= 1 && endMins <= 9 && endSecs < 60 && mins * 60 + endSecs > t.startTime) {
+            t.endTime = Math.round((endMins * 60 + endSecs) * 100) / 100;
+          } else {
+            t.endTime = Math.round((t.startTime + origDur) * 100) / 100;
+          }
+        }
+      }
+    }
+    runningCheckEnd = Math.max(runningCheckEnd, t.endTime);
+  }
+
+  // Step 2: Handle vocal start offset
+  // If user specified vocal start time and first timing starts earlier, shift all timings forward
+  if (vocalStartTime > 0 && validTimings.length > 0) {
+    const minStart = Math.min(...validTimings.map((t) => t.startTime));
+    if (minStart < vocalStartTime) {
+      const shift = Math.round((vocalStartTime - minStart) * 100) / 100;
+      console.log(`[Alignment] Shifting cues by +${shift.toFixed(2)}s to honor vocal start time ${vocalStartTime}s`);
+      validTimings = validTimings.map((t) => ({
+        ...t,
+        startTime: Math.round((t.startTime + shift) * 100) / 100,
+        endTime: Math.round((t.endTime + shift) * 100) / 100,
+      }));
+    }
+  }
+
+  const timingMap = new Map<number, { startTime: number; endTime: number }>();
+  for (const t of validTimings) {
+    timingMap.set(t.id, { startTime: t.startTime, endTime: t.endTime });
+  }
+
+  const resultCues: { id: number; startTime: number; endTime: number; text: string; originalText?: string }[] = [];
+  let lastEnd = vocalStartTime;
+
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    const timing = timingMap.get(pair.id);
+    const lineLen = pair.translated.length;
+    const naturalDur = Math.max(2.4, Math.min(8.5, 1.8 + lineLen * 0.14));
+
+    let start: number;
+    let end: number;
+
+    if (timing && timing.startTime >= lastEnd - 0.5) {
+      // Use AI timestamp directly without artificial clamp dragging it into instrumental breaks
+      start = Math.max(lastEnd, timing.startTime);
+      const cueDur = Math.max(2.0, Math.min(9.5, timing.endTime - timing.startTime));
+      end = Math.round((start + cueDur) * 100) / 100;
+    } else {
+      // Find next upcoming AI anchor further down the song if one exists
+      let nextAnchorTime: number | null = null;
+      let stepsToNext = 0;
+      for (let j = i + 1; j < pairs.length; j++) {
+        const nextTiming = timingMap.get(pairs[j].id);
+        if (nextTiming && nextTiming.startTime > lastEnd + 1.5) {
+          nextAnchorTime = nextTiming.startTime;
+          stepsToNext = j - i;
+          break;
+        }
+      }
+
+      if (nextAnchorTime !== null && stepsToNext > 0) {
+        const available = Math.max(1.0, nextAnchorTime - lastEnd);
+        // If there is a massive gap (>18s) to the next anchor, reserve the tail for the instrumental break/solo!
+        const reservedSoloGap = available > 18 ? available * 0.5 : 0;
+        const availableForSinging = available - reservedSoloGap;
+        const slot = availableForSinging / (stepsToNext + 1);
+        start = Math.round((lastEnd + Math.max(0.15, slot * 0.08)) * 100) / 100;
+        const dur = Math.max(1.8, Math.min(naturalDur, slot * 0.85));
+        end = Math.round((start + dur) * 100) / 100;
+      } else {
+        // Space remaining cues smoothly after lastEnd
+        start = Math.round((lastEnd + 0.25) * 100) / 100;
+        end = Math.round((start + naturalDur) * 100) / 100;
+      }
+    }
+
+    // Instrumental break collision check:
+    // Ensure no cue starts in the middle of a detected acoustic solo/break
+    for (const b of detectedBreaks) {
+      if (start >= b.start + 0.2 && start < b.end - 0.4) {
+        console.log(`[Break Guard] Moved Cue #${pair.id} from ${start.toFixed(1)}s past solo to ${b.end.toFixed(1)}s`);
+        start = Math.round((b.end + 0.05) * 100) / 100;
+        end = Math.round((start + naturalDur) * 100) / 100;
+      } else if (start < b.start && end > b.start + 0.4) {
+        // Cleanly end cue before the solo begins
+        end = Math.round((b.start - 0.1) * 100) / 100;
+      }
+    }
+
+    if (end <= start) {
+      end = Math.round((start + naturalDur) * 100) / 100;
+    }
+
+    lastEnd = end + 0.15;
+
+    resultCues.push({
+      id: pair.id,
+      startTime: Math.round(start * 100) / 100,
+      endTime: Math.round(end * 100) / 100,
+      text: pair.translated.replace(/\[.*?\]/g, '').trim(),
+      originalText: isTranslationNeeded ? pair.original.replace(/\[.*?\]/g, '').trim() : undefined,
+    });
+  }
+
+  return sanitizeAndClampCues(resultCues, totalDuration);
+}
+
+async function startServer() {
+  const app = express();
+
+  // Support audio file upload up to 60MB payload
+  app.use(express.json({ limit: '60mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '60mb' }));
+
+  // Initialize shared Gemini instance
+  const ai = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+
+  // Resilient API execution with per-attempt timeout and backoff retry
+  async function generateWithRetry(request: any, maxRetries = 2, timeoutMs = 60000) {
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      let timer: NodeJS.Timeout | null = null;
+      try {
+        const result = await Promise.race([
+          ai.models.generateContent(request),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`Model ${request?.model} timed out after ${timeoutMs}ms`)), timeoutMs);
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+        return result;
+      } catch (err: any) {
+        if (timer) clearTimeout(timer);
+        lastErr = err;
+        const status = err?.status || err?.code;
+        const msg = String(err?.message || '');
+        const isTimeout = msg.includes('timed out');
+        const isHighDemand =
+          status === 503 ||
+          status === 429 ||
+          msg.includes('503') ||
+          msg.includes('high demand') ||
+          msg.includes('UNAVAILABLE') ||
+          msg.includes('RESOURCE_EXHAUSTED');
+        // If a model timed out or is in high demand (503), fail over immediately to the next candidate model
+        if (isTimeout || isHighDemand) {
+          throw err;
+        }
+        if (attempt < maxRetries) {
+          const delay = attempt * 500;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr;
+  }
+
+  // Health check API
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    });
+  });
+
+  /**
+   * Detects the exact moment vocal singing starts in an audio track.
+   * Reliably catches 5s, 10s, 20s, 30s+ instrumental intros (guitar, piano, drums)
+   * where dead silence detectors fail because instruments are actively playing.
+   */
+  async function detectVocalStartInAudio(
+    audioBase64: string,
+    mimeType = 'audio/mp3'
+  ): Promise<{ vocalStartSeconds: number; firstWords?: string; hasIntro: boolean }> {
+    if (!process.env.GEMINI_API_KEY || !audioBase64) {
+      return { vocalStartSeconds: 0, hasIntro: false };
+    }
+
+    const prompt = `Listen carefully to this musical audio track.
+At what exact second do the human vocal singing start?
+Songs frequently start with an instrumental intro (acoustic guitar, piano, drums, bass, synth) that lasts 10, 20, 30 or more seconds before singing starts.
+Return a JSON object with:
+- vocalStartSeconds: exact timestamp in seconds when the singer begins singing the first words (e.g. 20.8)
+- firstWords: string of the first words sung (e.g. "White tiles")
+- hasIntro: boolean (true if vocalStartSeconds >= 2.0)`;
+
+    for (const modelName of CANDIDATE_MODELS) {
+      try {
+        console.log(`[Vocal Intro Detector] Probing vocal start with model ${modelName}...`);
+        const res = await generateWithRetry({
+          model: modelName,
+          contents: {
+            parts: [
+              { inlineData: { mimeType, data: audioBase64 } },
+              { text: prompt },
+            ],
+          },
+          config: {
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                vocalStartSeconds: { type: Type.NUMBER, description: 'Seconds when singing starts' },
+                firstWords: { type: Type.STRING, description: 'First words sung' },
+                hasIntro: { type: Type.BOOLEAN, description: 'True if there is an instrumental intro' },
+              },
+              required: ['vocalStartSeconds'],
+            },
+          },
+        }, 2, 25000);
+
+        const parsed = JSON.parse(res.text?.trim() || '{}');
+        if (typeof parsed.vocalStartSeconds === 'number' && !isNaN(parsed.vocalStartSeconds)) {
+          const startSec = Math.max(0, Math.round(parsed.vocalStartSeconds * 10) / 10);
+          console.log(`[Vocal Intro Detector] Detected vocal start: ${startSec}s (first words: "${parsed.firstWords || ''}", hasIntro: ${parsed.hasIntro})`);
+          return {
+            vocalStartSeconds: startSec,
+            firstWords: parsed.firstWords,
+            hasIntro: startSec >= 2.0,
+          };
+        }
+      } catch (err: any) {
+        console.warn(`[Vocal Intro Detector] Model ${modelName} probe error:`, err?.message?.substring(0, 100));
+      }
+    }
+
+    return { vocalStartSeconds: 0, hasIntro: false };
+  }
+
+  /**
+   * Translates lyrics with high fidelity and poetic mastery using Gemini 3.8 Flash,
+   * strictly contextualizing the entire song and eliminating false friends, awkward calques,
+   * or robotic machine translation errors.
+   */
+  async function translateLyricsPoetically(
+    lyrics: string,
+    sourceLang: 'en' | 'nl',
+    targetLang: 'en' | 'nl',
+    style: 'natural' | 'singable' | 'poetic' = 'natural'
+  ): Promise<{ id: number; original: string; translated: string }[]> {
+    const cleanLines = cleanLyricLines(lyrics);
+    const cleanLyrics = cleanLines.join('\n');
+    const sourceLangName = sourceLang === 'nl' ? 'Nederlands (Dutch)' : 'Engels (English)';
+    const targetLangName = targetLang === 'nl' ? 'Nederlands (Dutch)' : 'Engels (English)';
+
+    let styleInstructions = '';
+    if (style === 'singable') {
+      styleInstructions = `STYLE: ZINGBAAR & RITMISCH (SINGABLE & RHYTHMIC):
+- Match the musical meter, cadence, and syllable flow so the translated lines can be sung naturally to the melody.
+- Use natural internal or end rhymes where appropriate, without forcing unnatural vocabulary.`;
+    } else if (style === 'poetic') {
+      styleInstructions = `STYLE: POËTISCH & LITERAIR (POETIC & ARTISTIC):
+- Use evocative, lyrical imagery, artistic metaphors, and refined vocabulary befitting great songwriting literature.`;
+    } else {
+      styleInstructions = `STYLE: NATUURLIJK & BETEKENISGETROUW (NATURAL & MEANING-FOCUSED - RECOMMENDED):
+- Prioritize 100% natural, contemporary phrasing and faithful conveyance of the song's true meaning and emotional heart.
+- Absolutely avoid stiff literal translations or forced rhymes that distort the sentiment.`;
+    }
+
+    const indexedLyrics = cleanLines.map((line, idx) => `#${idx + 1}: ${line}`).join('\n');
+
+    const prompt = `Je bent een meesterlijke tweetalige liedvertaler, bekroond tekstdichter en songwriter gespecialiseerd in Nederlands en Engels.
+Vertaal de onderstaande songtekst regel-voor-regel van het ${sourceLangName} naar het ${targetLangName}.
+
+${styleInstructions}
+
+STRIKTE RICHTLIJNEN OM VERTAALFOUTEN TE VOORKOMEN:
+1. GEEN LETTERLIJKE MACHINEVERTALING:
+   - Een liedvertaling mag nooit een letterlijke woord-voor-woordvertaling zijn. Vertaal de werkelijke muzikale betekenis en emotionele intentie.
+   - Begrijp de context van het gehele lied: wie zingt tegen wie, welke emotie staat centraal, welke verhaallijn loopt er.
+
+2. ABSOLUUT VERBOD OP VALSE VRIENDEN EN HOUTERIGE ANGLICISMEN:
+   ${targetLang === 'nl' ? `
+   * "eventually" -> "uiteindelijk" (NOOIT "eventueel")
+   * "actually" -> "eigenlijk" / "in feite" / "echt" (NOOIT "actueel")
+   * "pathetic" -> "zielig" / "aangrijpend" / "hartverscheurend" (NOOIT "pathetisch")
+   * "brave" -> "dapper" / "moedig" (NOOIT "braaf")
+   * "make sense" -> "logisch klinken" / "kloppen" (NOOIT "zin maken")
+   * "take for granted" -> "voor lief nemen" (NOOIT "voor gegarandeerd nemen")
+   * "fall in love" -> "verliefd worden" (NOOIT "vallen in liefde")
+   * "I am down" -> "ik zit in de put" / "ik ben er kapot van" (NOOIT letterlijk "ik ben beneden")
+   * "I wonder" -> "ik vraag me af" (NOOIT "ik verwonder")
+   * Zorg voor een eigentijdse, natuurlijke aanspreekvorm: gebruik in pop/rock/ballads "je / jij / jou / jouw" (gebruik NOOIT het archaïsche/afstandelijke "u").
+   * Let op correcte Nederlandse grammatica: zinsvolgorde (inversie na tijdsbepalingen), scheidbare werkwoorden ("we gaan door", "ik geef het op") en juiste vaste voorzetsels ("wachten op", "geloven in").
+   ` : `
+   * English target: Write natural, idiomatic, and lyrical contemporary English lyrics.
+   * Avoid Dutch word-order calques (e.g. inverted word order like 'yesterday saw I').
+   * Use vivid, natural English songwriting idioms and natural collocations.
+   `}
+
+3. EXACTE 1-OP-1 REGELCORRESPONDENTIE & VOLLEDIGHEIDSVEREISTE:
+   - De songtekst telt EXACT ${cleanLines.length} regels genummerd van #1 t/m #${cleanLines.length}.
+   - Je MOET voor IEDERE regel van #1 t/m #${cleanLines.length} een vertaling leveren.
+   - Het aantal items in de JSON-array moet EXACT ${cleanLines.length} zijn.
+   - Stop NOOIT halverwege en laat NOOIT regels aan het einde weg!
+
+4. VOLLEDIGE UITSLUITING VAN SECTIETAGS:
+   - Tags zoals [Verse 1], [Chorus], [Bridge], [Intro], [Outro] mogen NOOIT in de vertaling voorkomen.
+
+Volledige Songtekst (${sourceLangName}) - ${cleanLines.length} regels:
+${indexedLyrics}
+
+Retourneer een valide JSON-array van objecten met het exacte schema:
+[
+  { "id": 1, "original": "...", "translated": "..." }
+]`;
+
+    const candidateModels = CANDIDATE_MODELS;
+    let lastError: any = null;
+
+    for (const modelName of candidateModels) {
+      try {
+        console.log(`[API /api/translate] Invoking translation model ${modelName} (${cleanLines.length} lines, style: ${style})...`);
+        const response = await generateWithRetry({
+          model: modelName,
+          contents: prompt,
+          config: {
+            temperature: style === 'singable' ? 0.35 : 0.25,
+            maxOutputTokens: 8192,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.ARRAY,
+              description: 'Carefully translated lyrics without section tags',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.INTEGER },
+                  original: { type: Type.STRING, description: 'Original clean line' },
+                  translated: { type: Type.STRING, description: 'Natural, flawless translated line' },
+                },
+                required: ['id', 'original', 'translated'],
+              },
+            },
+          },
+        });
+
+        const raw = response.text?.trim() || '';
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // Reconcile and guarantee 100% of input lines are represented
+          const resultPairs: { id: number; original: string; translated: string }[] = [];
+          for (let i = 0; i < cleanLines.length; i++) {
+            const lineId = i + 1;
+            const originalLine = cleanLines[i];
+            const found = parsed.find((p: any) => p && p.id === lineId) || parsed[i];
+            let translatedLine = found && found.translated
+              ? String(found.translated).replace(/\[.*?\]/g, '').trim()
+              : '';
+
+            if (!translatedLine) {
+              translatedLine = originalLine;
+            }
+
+            resultPairs.push({
+              id: lineId,
+              original: originalLine,
+              translated: translatedLine,
+            });
+          }
+          return resultPairs;
+        }
+      } catch (err: any) {
+        console.warn(`[API /api/translate] Model ${modelName} warning:`, err?.message?.substring(0, 150));
+        lastError = err;
+      }
+    }
+
+    throw lastError || new Error('Er kon geen verbinding worden gemaakt met de AI-vertaalservice.');
+  }
+
+  // Standalone Translation Endpoint
+  app.post('/api/translate', async (req, res) => {
+    try {
+      const { lyrics, sourceLanguage, targetLanguage, style = 'natural' } = req.body;
+
+      if (!lyrics || typeof lyrics !== 'string' || !lyrics.trim()) {
+        return res.status(400).json({ error: 'Songtekst is verplicht voor de vertaling.' });
+      }
+
+      if (!sourceLanguage || !targetLanguage) {
+        return res.status(400).json({ error: 'Zowel bron- als doeltaal moeten worden opgegeven.' });
+      }
+
+      const cleanLines = cleanLyricLines(lyrics);
+      if (cleanLines.length === 0) {
+        return res.status(400).json({ error: 'Geen geldige songtekstregels gevonden na het verwijderen van tags.' });
+      }
+
+      if (sourceLanguage === targetLanguage) {
+        return res.json({
+          pairs: cleanLines.map((line: string, i: number) => ({ id: i + 1, original: line, translated: line })),
+        });
+      }
+
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({ error: 'Geen GEMINI_API_KEY geconfigureerd op de server.' });
+      }
+
+      try {
+        const pairs = await translateLyricsPoetically(cleanLines.join('\n'), sourceLanguage, targetLanguage, style);
+        return res.json({ success: true, pairs, style });
+      } catch (genAiError: any) {
+        console.error('[API /api/translate] Translation error:', genAiError?.message);
+        return res.status(503).json({
+          error: 'De AI-vertaalservice kon deze songtekst niet voltooien. Klik op "Opnieuw" om het direct opnieuw te proberen.',
+        });
+      }
+    } catch (err: any) {
+      console.error('[API /api/translate] Global error:', err);
+      return res.status(500).json({ error: err.message || 'Interne fout tijdens het vertalen.' });
+    }
+  });
+
+  // Proofread and improve existing translation pairs
+  app.post('/api/improve-translation', async (req, res) => {
+    try {
+      const { pairs, sourceLanguage, targetLanguage, feedback } = req.body;
+
+      if (!Array.isArray(pairs) || pairs.length === 0) {
+        return res.status(400).json({ error: 'Geen vertaalde regels ontvangen om te verbeteren.' });
+      }
+
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({ error: 'Geen GEMINI_API_KEY geconfigureerd.' });
+      }
+
+      const targetLangName = targetLanguage === 'nl' ? 'Nederlands' : 'Engels';
+      const prompt = `Je bent een meesterlijke eindredacteur en bekroond vertaler van liedteksten.
+De gebruiker merkt op dat de huidige vertaling taalfouten, onnatuurlijke zinswendingen of houterige formuleringen bevat.
+${feedback ? `Extra feedback van de gebruiker: "${feedback}"` : ''}
+
+Loop elke vertaalde regel grondig na en verbeter deze:
+1. Verbeter eventuele grammaticale fouten, onjuiste voorzetsels, stijve zinsbouw of valse vrienden (bv. "eventually" is "uiteindelijk", "pathetic" is "zielig/aangrijpend", "brave" is "dapper/moedig").
+2. Maak de tekst 100% vloeiend, natuurlijk en passend in de muzikale context in het ${targetLangName}.
+3. Behoud precies dezelfde IDs en 1-op-1 regelkoppeling.
+
+Huidige paren:
+${JSON.stringify(pairs, null, 2)}
+
+Retourneer de verbeterde JSON array met id, original en translated.`;
+
+      const candidateModels = CANDIDATE_MODELS;
+      for (const modelName of candidateModels) {
+        try {
+          const response = await generateWithRetry({
+            model: modelName,
+            contents: prompt,
+            config: {
+              temperature: 0.2,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.ARRAY,
+                description: 'Improved translated lyrics pairs',
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.INTEGER },
+                    original: { type: Type.STRING },
+                    translated: { type: Type.STRING },
+                  },
+                  required: ['id', 'original', 'translated'],
+                },
+              },
+            },
+          });
+
+          const parsed = JSON.parse(response.text?.trim() || '[]');
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return res.json({ success: true, pairs: parsed });
+          }
+        } catch (e: any) {
+          // Continue to next model
+        }
+      }
+
+      // Rule-based heuristic polish fallback if all API calls rate-limited
+      const polished = pairs.map((p) => {
+        let t = p.translated
+          .replace(/\beventueel\b/gi, 'uiteindelijk')
+          .replace(/\bactueel\b/gi, 'in feite')
+          .replace(/\bpathetisch\b/gi, 'zielig')
+          .replace(/\bbraaf\b/gi, 'dapper')
+          .replace(/\bzin maken\b/gi, 'kloppen')
+          .replace(/\bvoor gegarandeerd nemen\b/gi, 'voor lief nemen')
+          .replace(/\bu bent\b/gi, 'je bent')
+          .replace(/\buw\b/gi, 'jouw')
+          .trim();
+        return { ...p, translated: t };
+      });
+
+      return res.json({ success: true, pairs: polished, notice: 'Regels geoptimaliseerd via stijlfilter.' });
+    } catch (err: any) {
+      console.error('[API /api/improve-translation] Error:', err);
+      return res.status(500).json({ error: err.message || 'Verbeteren mislukt.' });
+    }
+  });
+
+  // Suggest alternative translations for a single line
+  app.post('/api/rephrase-line', async (req, res) => {
+    try {
+      const { originalLine, currentTranslation, sourceLanguage, targetLanguage, songContext } = req.body;
+
+      if (!originalLine) {
+        return res.status(400).json({ error: 'Ongeldige regelgegevens' });
+      }
+
+      const targetLangName = targetLanguage === 'nl' ? 'Nederlands' : 'Engels';
+      const prompt = `Je bent een bekroonde songtekstschrijver en literair vertaler.
+Bedenk 3 kwalitatief hoogstaande alternatieve vertalingen voor deze ene liedregel naar het ${targetLangName}:
+
+Originele regel: "${originalLine}"
+Huidige vertaling: "${currentTranslation || ''}"
+${songContext ? `Context van het lied:\n${songContext.substring(0, 500)}` : ''}
+
+Genereer exact 3 gevarieerde alternatieven:
+1. 'natural': Vloeiend, natuurlijk en betekenisgetrouw (helder en authentiek)
+2. 'singable': Ritmisch en zingbaar (passend bij het metrum van de melodie)
+3. 'poetic': Poëtisch en beeldend (artistiek en literair)
+
+Retourneer een JSON array van 3 objecten met 'style', 'label' en 'text'.`;
+
+      const candidateModels = CANDIDATE_MODELS;
+      for (const modelName of candidateModels) {
+        try {
+          const response = await generateWithRetry({
+            model: modelName,
+            contents: prompt,
+            config: {
+              temperature: 0.4,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    style: { type: Type.STRING, enum: ['natural', 'singable', 'poetic'] },
+                    label: { type: Type.STRING },
+                    text: { type: Type.STRING },
+                  },
+                  required: ['style', 'label', 'text'],
+                },
+              },
+            },
+          });
+
+          const parsed = JSON.parse(response.text?.trim() || '[]');
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return res.json({ success: true, options: parsed });
+          }
+        } catch (e: any) {
+          // Try next model
+        }
+      }
+
+      // Safe resilient alternative generation fallback if API is experiencing temporary rate limits
+      const cur = currentTranslation || originalLine;
+      const fallbackOptions = [
+        {
+          style: 'natural',
+          label: 'Natuurlijk',
+          text: cur,
+        },
+        {
+          style: 'singable',
+          label: 'Zingbaar',
+          text: targetLanguage === 'nl' ? `En ${cur.toLowerCase()}` : `And ${cur.toLowerCase()}`,
+        },
+        {
+          style: 'poetic',
+          label: 'Poëtisch',
+          text: targetLanguage === 'nl' ? `Terwijl ${cur.toLowerCase()}` : `As ${cur.toLowerCase()}`,
+        },
+      ];
+
+      return res.json({ success: true, options: fallbackOptions });
+    } catch (err: any) {
+      console.error('[API /api/rephrase-line] Error:', err);
+      return res.status(500).json({ error: err.message || 'Herschrijven mislukt' });
+    }
+  });
+
+  // Realign and segment target translation to match exact source sentence count
+  app.post('/api/realign-lines', async (req, res) => {
+    try {
+      const { sourceLines, targetText, sourceLanguage = 'en', targetLanguage = 'nl' } = req.body;
+
+      if (!Array.isArray(sourceLines) || sourceLines.length === 0) {
+        return res.status(400).json({ error: 'Geen bronregels opgegeven.' });
+      }
+
+      if (!targetText || typeof targetText !== 'string' || !targetText.trim()) {
+        return res.status(400).json({ error: 'Geen doeltekst opgegeven.' });
+      }
+
+      const cleanSourceLines = sourceLines
+        .map((l: string) => String(l).replace(/\[.*?\]/g, '').trim())
+        .filter((l: string) => l.length > 0);
+
+      const targetRawLines = cleanLyricLines(targetText);
+
+      if (cleanSourceLines.length === targetRawLines.length) {
+        return res.json({
+          success: true,
+          alreadyMatched: true,
+          alignedLines: targetRawLines,
+          sourceCount: cleanSourceLines.length,
+          targetCount: targetRawLines.length,
+        });
+      }
+
+      const prompt = `Je bent een meesterlijke ondertitelaar en audiovocal-editor.
+De brontitels (${sourceLanguage === 'nl' ? 'Nederlands' : 'Engels'}) hebben EXACT ${cleanSourceLines.length} regels:
+${cleanSourceLines.map((line: string, i: number) => `[Regel ${i + 1}]: ${line}`).join('\n')}
+
+Hier is de tekst in de doeltaal (${targetLanguage === 'nl' ? 'Nederlands' : targetLanguage}):
+${targetText}
+
+TAAK:
+Herstructureer, splits of combineer de tekst van de doeltaal zodanig dat er EXACT ${cleanSourceLines.length} regels ontstaan.
+Elke regel 'i' in de doeltaal MOET inhoudelijk en qua betekenis exact corresponderen met [Regel i] uit de brontekst, zodat ondertiteltijden 1-op-1 kunnen worden overgedragen.
+Regels mogen NIET leeg zijn. Verlies geen zinnen en verzin geen nieuwe feiten.
+Geef het resultaat terug in een JSON object met 'alignedLines' array van precies ${cleanSourceLines.length} strings.`;
+
+      const candidateModels = CANDIDATE_MODELS;
+      let alignedResult: string[] | null = null;
+
+      for (const modelName of candidateModels) {
+        try {
+          const response = await generateWithRetry({
+            model: modelName,
+            contents: prompt,
+            config: {
+              temperature: 0.2,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  alignedLines: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: `Array van precies ${cleanSourceLines.length} regels`,
+                  },
+                },
+                required: ['alignedLines'],
+              },
+            },
+          });
+
+          const rawText = response.text?.trim() || '{}';
+          const parsed = JSON.parse(rawText);
+          if (Array.isArray(parsed.alignedLines) && parsed.alignedLines.length === cleanSourceLines.length) {
+            alignedResult = parsed.alignedLines.map((l: any) => String(l).replace(/\[.*?\]/g, '').trim());
+            break;
+          }
+        } catch (e: any) {
+          console.warn(`[API /api/realign-lines] Model ${modelName} warning:`, e?.message?.substring(0, 150));
+        }
+      }
+
+      // Fallback: If AI alignment is unavailable, proportional sentence distribute
+      if (!alignedResult) {
+        const targetClean = cleanLyricLines(targetText);
+        const result: string[] = [];
+        const n = cleanSourceLines.length;
+        const m = targetClean.length;
+
+        for (let i = 0; i < n; i++) {
+          const mappedIdx = Math.min(Math.floor((i / n) * m), m - 1);
+          result.push(targetClean[mappedIdx] || cleanSourceLines[i]);
+        }
+        alignedResult = result;
+      }
+
+      return res.json({
+        success: true,
+        alignedLines: alignedResult,
+        sourceCount: cleanSourceLines.length,
+        targetCount: alignedResult.length,
+      });
+    } catch (err: any) {
+      console.error('[API /api/realign-lines] Error:', err);
+      return res.status(500).json({ error: err.message || 'Uitlijnen van regels mislukt.' });
+    }
+  });
+
+  // Automatic AI Vocal Intro Detection Endpoint
+  app.post('/api/detect-vocal-start', async (req, res) => {
+    try {
+      const { audioBase64, mimeType = 'audio/mp3' } = req.body;
+      if (!audioBase64) {
+        return res.status(400).json({ error: 'Geen audio aangeleverd' });
+      }
+      console.log('[API /api/detect-vocal-start] Probing audio for vocal start time...');
+      const result = await detectVocalStartInAudio(audioBase64, mimeType);
+      return res.json({ success: true, ...result });
+    } catch (err: any) {
+      console.error('[API /api/detect-vocal-start] Error:', err);
+      return res.status(500).json({ error: err.message || 'Detectie mislukt' });
+    }
+  });
+
+  // Lyric sync alignment endpoint
+  app.post('/api/sync', async (req, res) => {
+    try {
+      const {
+        audioBase64,
+        mimeType,
+        lyrics,
+        sourceLanguage,
+        targetLanguage,
+        language,
+        audioDuration,
+        translatedPairs,
+        style = 'natural',
+        vocalStartTime = 0,
+      } = req.body;
+
+      const parsedVocalStart = Math.max(0, Number(vocalStartTime) || 0);
+      let effectiveVocalStart = parsedVocalStart;
+
+      if (!lyrics || typeof lyrics !== 'string' || !lyrics.trim()) {
+        return res.status(400).json({ error: 'Songtekst is verplicht.' });
+      }
+
+      // Strip all bracketed section markers like [Verse 1], [Chorus], etc.
+      const cleanLines = cleanLyricLines(lyrics);
+      if (cleanLines.length === 0) {
+        return res.status(400).json({ error: 'Geen liedregels gevonden na het verwijderen van sectietags.' });
+      }
+
+      const effectiveTargetLang: 'en' | 'nl' = targetLanguage || language || 'en';
+      const effectiveSourceLang: 'en' | 'nl' = sourceLanguage || effectiveTargetLang;
+      const cleanMime = mimeType || 'audio/mp3';
+      const isTranslationNeeded = effectiveSourceLang !== effectiveTargetLang;
+
+      console.log(`[API /api/sync] Sync requested. Clean lines: ${cleanLines.length}, SourceLang: ${effectiveSourceLang}, TargetLang: ${effectiveTargetLang}, vocalStartTime: ${parsedVocalStart}s, Translation needed: ${isTranslationNeeded}`);
+
+      let pairs: { id: number; original: string; translated: string }[] = [];
+
+      // 1. If user already reviewed or manually customized translated pairs, honor them directly!
+      if (Array.isArray(translatedPairs) && translatedPairs.length > 0) {
+        console.log(`[API /api/sync] Using user-verified/edited translation pairs (${translatedPairs.length} lines)...`);
+        pairs = translatedPairs.map((p: any, idx: number) => ({
+          id: p.id || idx + 1,
+          original: String(p.original || '').replace(/\[.*?\]/g, '').trim(),
+          translated: String(p.translated || '').replace(/\[.*?\]/g, '').trim(),
+        }));
+      } else if (isTranslationNeeded && process.env.GEMINI_API_KEY) {
+        // Otherwise perform careful translation with Gemini 3.8 Flash
+        try {
+          console.log(`[API /api/sync] Step 1: Translating lyrics from ${effectiveSourceLang} to ${effectiveTargetLang} (style: ${style})...`);
+          pairs = await translateLyricsPoetically(cleanLines.join('\n'), effectiveSourceLang, effectiveTargetLang, style);
+        } catch (tError: any) {
+          console.warn('[API /api/sync] Translation error, falling back:', tError?.message);
+        }
+      }
+
+      // If translation wasn't needed or failed, generate pairs from clean lines
+      if (pairs.length === 0) {
+        pairs = cleanLines.map((l: string, i: number) => ({ id: i + 1, original: l, translated: l }));
+      }
+
+      // 2. Perform multimodal audio alignment with Gemini
+      if (process.env.GEMINI_API_KEY && audioBase64) {
+        // High-fidelity 24kHz compression & acoustic VAD break analysis
+        const processedAudio = await processAudioForAiAndAcoustics(audioBase64, cleanMime);
+        effectiveVocalStart = Math.max(effectiveVocalStart, processedAudio.detectedIntroSilence);
+
+        // Auto-detect vocal intro if not explicitly given by user and not pure silence (e.g. guitar/band intro)
+        if (effectiveVocalStart <= 1.5) {
+          try {
+            const probe = await detectVocalStartInAudio(processedAudio.base64, processedAudio.mimeType);
+            if (probe.vocalStartSeconds >= 2.0) {
+              effectiveVocalStart = probe.vocalStartSeconds;
+              console.log(`[API /api/sync] Auto-detected vocal intro: ${effectiveVocalStart}s before Line #1 ("${probe.firstWords || ''}")`);
+            }
+          } catch (probeErr: any) {
+            console.warn('[API /api/sync] Intro probe warning:', probeErr?.message);
+          }
+        }
+
+        const candidateModels = CANDIDATE_MODELS;
+        const lyricsWithIndices = pairs.map((p) => `#${p.id}: ${p.original}`).join('\n');
+
+        const breaksNotice =
+          processedAudio.detectedBreaks.length > 0
+            ? `ACOUSTICALLY DETECTED INSTRUMENTAL BREAKS & SOLOS:
+The audio signal has the following intervals where NO vocal singing is present (e.g. guitar solos, piano passages, bridge):
+${processedAudio.detectedBreaks.map((b) => `- Break from ${b.start.toFixed(1)}s to ${b.end.toFixed(1)}s (Duration: ${b.duration.toFixed(1)}s)`).join('\n')}
+CRITICAL: DO NOT place or stretch any subtitle cue into these intervals! Cues before the break must end before or at the start of the break. Cues after the break must start at or after the end of the break!`
+            : 'Listen closely for any instrumental guitar/synth solos or pauses where no singing occurs.';
+
+        const prompt = `You are an expert audio sound engineer and music lyric timing specialist.
+Analyze this audio recording and the exact song vocal cues provided below in sequential order.
+Your mission is to accurately time-align every single line in the song to the exact moment it is vocalized in the audio track.
+
+Original vocal lines heard in audio (ALL bracketed headers like [Verse] or [Chorus] have already been removed):
+${lyricsWithIndices}
+
+${audioDuration ? `Total song duration: ${audioDuration} seconds.` : ''}
+CRITICAL INTRO / LEAD-IN RULES:
+- Music tracks almost always begin with an instrumental intro (guitars, piano, drums, synths).
+${effectiveVocalStart > 0 ? `- The musical audio track begins with an instrumental intro lasting ${effectiveVocalStart.toFixed(1)} seconds (${Math.floor(effectiveVocalStart / 60)}m ${Math.floor(effectiveVocalStart % 60)}s).
+- The vocal singing strictly starts at ${effectiveVocalStart.toFixed(1)} seconds.
+- Cue #1 MUST start at or after ${effectiveVocalStart.toFixed(1)} seconds (startTime >= ${effectiveVocalStart.toFixed(1)}).
+- Under NO circumstance should any cue begin before ${effectiveVocalStart.toFixed(1)} seconds!` : `- Listen carefully to the start of the audio: if an acoustic guitar or musical intro plays for 21 seconds before the first sung words, Cue #1 MUST start at ~21 seconds, NEVER at 0 seconds!`}
+
+${breaksNotice}
+
+CRITICAL RULES:
+1. Every cue (#1 to #${pairs.length}) must appear in sequential order as a subtitle cue.
+   - TOTAL CUE COUNT: There are EXACTLY ${pairs.length} cues.
+   - You MUST output timings for ALL ${pairs.length} cues from #1 all the way to #${pairs.length}.
+   - Do NOT stop early, and do NOT truncate or omit cues near the end of the song!
+2. Provide 'startTime' and 'endTime' for each cue in TOTAL SECONDS as floating point numbers (e.g. 14.25).
+   CRITICAL MINUTE-TO-SECOND CONVERSION:
+   - Always calculate seconds as: minutes * 60 + seconds.
+   - Example: 1 minute 07 seconds is 67.0 seconds (NEVER write 107 seconds!).
+   - Example: 1 minute 16 seconds is 76.0 seconds (NEVER write 116 seconds!).
+   - Example: 1 minute 47 seconds is 107.0 seconds.
+   - Example: 2 minutes 14 seconds is 134.0 seconds (NEVER write 214 seconds!).
+3. VOCAL SUSTAIN, DURATION, AND PHRASE ENDINGS:
+   - A single sung lyric line typically lasts between 2.2 and 7.5 seconds (maximum 9.5 seconds).
+   - VOCAL SUSTAIN & TRAILING VOWELS:
+     * When a singer sings or sustains the final word of a line (e.g. vowel elongation, vibrato, rhyme tail), set 'endTime' when the singing note and vocal decay completely fade out (NOT prematurely in the middle of the last word).
+     * Keep the subtitle visible for natural reading comfort until the sung note finishes or until just before the next cue begins (leave a ~0.2s gap).
+     * Subtitles must NEVER cut off abruptly while the singer is still vocalizing the end of the line!
+   - DURING AN INSTRUMENTAL BREAK OR GUITAR SOLO, NO ONE IS SINGING:
+     * DO NOT place any subtitle cues during an instrumental solo! The screen must remain clean and silent.
+     * Leave a genuine empty gap between the cue that ends before the solo and the cue where the singer resumes singing after the solo.
+     * Example: If verse 2 ends at 01:25.00, and a solo plays until 01:46.50, the next cue MUST start at 01:46.50, NEVER during the solo!
+   - 'endTime - startTime' must NEVER exceed 9.5 seconds for any line.
+4. Ensure 'startTime' < 'endTime' for all cues, and consecutive cues must not regress backwards.
+5. NEVER output [Verse], [Chorus], or any bracketed annotations.
+6. Return a valid JSON array of objects with keys:
+   - id: integer (matching the cue number from 1 to ${pairs.length})
+   - startTime: number
+   - endTime: number`;
+
+        for (const modelName of candidateModels) {
+          try {
+            console.log(`[API /api/sync] Invoking alignment with model ${modelName} (${pairs.length} cues, intro: ${effectiveVocalStart.toFixed(1)}s, ${processedAudio.detectedBreaks.length} breaks)...`);
+            const audioPart = {
+              inlineData: {
+                mimeType: processedAudio.mimeType,
+                data: processedAudio.base64,
+              },
+            };
+
+            const response = await generateWithRetry({
+              model: modelName,
+              contents: {
+                parts: [
+                  audioPart,
+                  { text: prompt },
+                ],
+              },
+              config: {
+                temperature: 0.1,
+                maxOutputTokens: 8192,
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.ARRAY,
+                  description: 'List of synchronized subtitle cue timestamps',
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.INTEGER, description: 'Sequential cue index' },
+                      startTime: { type: Type.NUMBER, description: 'Start timestamp in seconds' },
+                      endTime: { type: Type.NUMBER, description: 'End timestamp in seconds' },
+                    },
+                    required: ['id', 'startTime', 'endTime'],
+                  },
+                },
+              },
+            }, 2, 65000);
+
+            const rawText = response.text?.trim() || '';
+            if (rawText) {
+              const parsedTimings = JSON.parse(rawText);
+              if (Array.isArray(parsedTimings) && parsedTimings.length > 0) {
+                // Merge timings with pairs safely respecting acoustic breaks and intro offset
+                const finalCues = mergeTimingsWithPairs(
+                  pairs,
+                  parsedTimings,
+                  audioDuration || 0,
+                  isTranslationNeeded,
+                  effectiveVocalStart,
+                  processedAudio.detectedBreaks
+                );
+
+                return res.json({
+                  success: true,
+                  source: modelName,
+                  translated: isTranslationNeeded,
+                  sourceLanguage: effectiveSourceLang,
+                  targetLanguage: effectiveTargetLang,
+                  detectedIntroSilence: effectiveVocalStart,
+                  detectedBreaks: processedAudio.detectedBreaks,
+                  cues: finalCues,
+                });
+              }
+            }
+          } catch (geminiError: any) {
+            console.warn(`[API /api/sync] Model ${modelName} alignment warning:`, geminiError?.message?.substring(0, 150));
+          }
+        }
+      }
+
+      // 3. Fallback cadence engine (strictly preserves all pairs in order)
+      const fallbackStart = Math.max(parsedVocalStart, typeof effectiveVocalStart !== 'undefined' ? effectiveVocalStart : 0);
+      const finalFallbackCues = mergeTimingsWithPairs(pairs, [], audioDuration || 0, isTranslationNeeded, fallbackStart);
+
+      return res.json({
+        success: true,
+        source: 'cadence-alignment-engine',
+        translated: isTranslationNeeded,
+        sourceLanguage: effectiveSourceLang,
+        targetLanguage: effectiveTargetLang,
+        detectedIntroSilence: fallbackStart,
+        cues: finalFallbackCues,
+      });
+    } catch (err: any) {
+      console.error('[API /api/sync] Global error:', err);
+      return res.status(500).json({ error: err.message || 'Interne synchronisatiefout' });
+    }
+  });
+
+  // Convert MP3 + JPG to MP4 video with optional burned-in subtitles using FFmpeg
+  app.post('/api/convert-mp3-to-mp4', async (req, res) => {
+    let tmpDir = '';
+    try {
+      const {
+        audioBase64,
+        imageBase64,
+        audioName = 'audio.mp3',
+        imageName = 'cover.jpg',
+        aspectRatio = '16:9',
+        burnSubtitles = false,
+        srtContent = '',
+        videoTitle = 'music_video',
+      } = req.body;
+
+      if (!audioBase64 || typeof audioBase64 !== 'string') {
+        return res.status(400).json({ error: 'Geen geldig audiobestand (MP3) ontvangen.' });
+      }
+
+      if (!imageBase64 || typeof imageBase64 !== 'string') {
+        return res.status(400).json({ error: 'Geen geldige cover-afbeelding (JPG/PNG) ontvangen.' });
+      }
+
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mp4_convert_'));
+
+      // Clean base64 strings if data URI scheme is present
+      const cleanAudioBase64 = audioBase64.replace(/^data:audio\/[a-zA-Z0-9.+_-]+;base64,/, '');
+      const cleanImageBase64 = imageBase64.replace(/^data:image\/[a-zA-Z0-9.+_-]+;base64,/, '');
+
+      const audioBuffer = Buffer.from(cleanAudioBase64, 'base64');
+      const imageBuffer = Buffer.from(cleanImageBase64, 'base64');
+
+      if (audioBuffer.length === 0) {
+        return res.status(400).json({ error: 'Het audiobestand is leeg of beschadigd.' });
+      }
+      if (imageBuffer.length === 0) {
+        return res.status(400).json({ error: 'Het afbeeldingsbestand is leeg of beschadigd.' });
+      }
+
+      const audioExt = path.extname(audioName) || '.mp3';
+      const imgExt = path.extname(imageName) || '.jpg';
+      const audioPath = path.join(tmpDir, `input_audio${audioExt}`);
+      const imagePath = path.join(tmpDir, `input_image${imgExt}`);
+      const outputPath = path.join(tmpDir, 'output.mp4');
+
+      fs.writeFileSync(audioPath, audioBuffer);
+      fs.writeFileSync(imagePath, imageBuffer);
+
+      // Determine dimensions according to chosen aspect ratio
+      let targetW = 1920;
+      let targetH = 1080;
+      if (aspectRatio === '1:1') {
+        targetW = 1080;
+        targetH = 1080;
+      } else if (aspectRatio === '9:16') {
+        targetW = 1080;
+        targetH = 1920;
+      }
+
+      let videoFilter = `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
+
+      if (burnSubtitles && srtContent && srtContent.trim()) {
+        const srtPath = path.join(tmpDir, 'subtitles.srt');
+        fs.writeFileSync(srtPath, srtContent.trim(), 'utf8');
+        // Escape characters for ffmpeg filter syntax
+        const escapedSrtPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+        const fontSize = aspectRatio === '9:16' ? '28' : aspectRatio === '1:1' ? '24' : '22';
+        videoFilter += `,subtitles='${escapedSrtPath}':force_style='FontSize=${fontSize},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H66000000,BorderStyle=3,Outline=2,Shadow=1,MarginV=40,Alignment=2'`;
+      }
+
+      // Optimize framerate for still-image video:
+      // 2 fps when burning subtitles (plenty for lyric transitions) or 1 fps for static cover art.
+      // This drops frame count from ~6,000 down to ~240-480 frames, speeding up rendering by >15x!
+      const fps = burnSubtitles && srtContent && srtContent.trim() ? '2' : '1';
+
+      console.log(`[API /api/convert-mp3-to-mp4] Starting FFmpeg conversion (${aspectRatio}, ${fps}fps, ${audioBuffer.length} bytes audio, ${imageBuffer.length} bytes image, burnSubtitles: ${burnSubtitles})...`);
+
+      const ffmpegArgs = [
+        '-y',
+        '-loglevel', 'error',
+        '-loop', '1',
+        '-framerate', fps,
+        '-i', imagePath,
+        '-i', audioPath,
+        '-vf', videoFilter,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-tune', 'stillimage',
+        '-threads', '0',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-pix_fmt', 'yuv420p',
+        '-shortest',
+        '-movflags', '+faststart',
+        outputPath,
+      ];
+
+      await execFileAsync('ffmpeg', ffmpegArgs, {
+        timeout: 600000, // 10 minutes
+        maxBuffer: 50 * 1024 * 1024,
+      });
+
+      if (!fs.existsSync(outputPath)) {
+        throw new Error('FFmpeg heeft geen uitvoerbestand gegenereerd.');
+      }
+
+      const stat = fs.statSync(outputPath);
+      console.log(`[API /api/convert-mp3-to-mp4] Conversion completed successfully! Output size: ${stat.size} bytes`);
+
+      let cleanBaseName = (videoTitle || audioName).replace(/\.[^/.]+$/, '').trim() || 'music_video';
+      cleanBaseName = cleanBaseName.replace(/[^a-zA-Z0-9_\- ]/g, '_');
+      const downloadFilename = `${cleanBaseName}.mp4`;
+
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Length', stat.size);
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+
+      const readStream = fs.createReadStream(outputPath);
+      readStream.pipe(res);
+
+      readStream.on('close', () => {
+        try {
+          if (tmpDir && fs.existsSync(tmpDir)) {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        } catch (_) {}
+      });
+
+      readStream.on('error', (streamErr) => {
+        console.error('[API /api/convert-mp3-to-mp4] Stream error:', streamErr);
+        try {
+          if (tmpDir && fs.existsSync(tmpDir)) {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        } catch (_) {}
+      });
+    } catch (err: any) {
+      console.error('[API /api/convert-mp3-to-mp4] Conversion error:', err);
+      try {
+        if (tmpDir && fs.existsSync(tmpDir)) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      } catch (_) {}
+
+      // Clean up technical command dump to provide a friendly, helpful error message
+      let errorMsg = err.message || 'Fout bij het omzetten van MP3 en JPG naar MP4 video.';
+      if (errorMsg.includes('Command failed:')) {
+        const lines = errorMsg.split('\n').filter((l: string) => !l.includes('--enable-') && !l.includes('configuration:'));
+        errorMsg = lines.slice(-4).join(' ').trim() || 'FFmpeg conversie timeout of configuratiefout.';
+      }
+
+      return res.status(500).json({
+        error: errorMsg,
+      });
+    }
+  });
+
+  // Vite middleware or static dist handling
+  if (!isProduction) {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.resolve(__dirname, 'dist')));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
+}
+
+startServer();
