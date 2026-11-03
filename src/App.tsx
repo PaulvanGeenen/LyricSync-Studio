@@ -20,7 +20,12 @@ import {
   TranslatedLinePair,
   TranslationStyle,
 } from './types/subtitle';
-import { extractWaveformPeaks } from './utils/audioWaveform';
+import {
+  extractWaveformPeaks,
+  detectVocalStartLocally,
+  alignLyricsToAudioAcoustically,
+} from './utils/audioWaveform';
+import { runLocalWhisperAlignment } from './utils/whisperAligner';
 import { DEMO_TRACKS, synthesizeDemoTrack } from './utils/audioSynthesizer';
 import { formatTimeDisplay } from './utils/timeFormat';
 import { CheckCircle2, AlertCircle, Info, FileSpreadsheet, RotateCcw, Video, Clock } from 'lucide-react';
@@ -105,7 +110,7 @@ export default function App() {
       setAudioUrl(url);
       setAudioName(file.name);
 
-      // Measure duration
+      // Measure duration & perform local acoustic analysis
       const tempAudio = new Audio(url);
       tempAudio.addEventListener('loadedmetadata', async () => {
         const dur = tempAudio.duration || 30;
@@ -114,6 +119,16 @@ export default function App() {
         // Extract waveform peaks
         const peaks = await extractWaveformPeaks(file);
         setWaveformPeaks(peaks);
+
+        // Local acoustic intro detection (works 100% offline without API key)
+        const localIntroSec = await detectVocalStartLocally(file);
+        if (localIntroSec >= 1.5) {
+          setVocalStartTime(localIntroSec);
+          showToast(
+            `✨ Muzikaal intro van ${localIntroSec}s akoestisch herkend (zang start op ${localIntroSec}s)!`,
+            'success'
+          );
+        }
       });
 
       // Convert to base64 for API sync & auto-probe vocal start
@@ -384,12 +399,12 @@ export default function App() {
 
   // Synchronize Lyrics to Audio Submission
   const handleSubmitSync = async () => {
+    const rawLyricsWithStructure = lyrics;
     const cleanLyrics = autoCleanLyrics(lyrics);
     if (!audioName || audioDuration <= 0 || !cleanLyrics.trim() || !targetLanguage) {
       showToast('Vul eerst alle 3 de vereisten in', 'error');
       return;
     }
-    setLyrics(cleanLyrics);
 
     const isTranslating = sourceLanguage !== targetLanguage;
 
@@ -398,7 +413,7 @@ export default function App() {
       step: 1,
       stepLabel: isTranslating
         ? `Zorgvuldige vertaling naar het ${targetLanguage === 'nl' ? 'Nederlands' : 'Engels'}...`
-        : 'Frequentiepatronen en audio spectrum analyseren...',
+        : 'Vocale frequentieband (280–3500 Hz) en audio spectrum analyseren...',
       progressPercent: 20,
     });
 
@@ -410,22 +425,22 @@ export default function App() {
           step: 2,
           stepLabel: isTranslating
             ? 'Liedstructuur, rijmschema en metrum verifiëren...'
-            : `Liedcadans analyseren in het ${targetLanguage === 'nl' ? 'Nederlands' : 'Engels'}...`,
+            : `Adempauzes, frasedalen en zanginzetten detecteren...`,
           progressPercent: 48,
         }));
-      }, 1000);
+      }, 600);
 
       // Step 3 Progress
       setTimeout(() => {
         setProgressState((prev) => ({
           ...prev,
           step: 3,
-          stepLabel: 'Multimodale audio-uitlijning met Gemini AI...',
+          stepLabel: 'Akoestische zang-uitlijning op de geluidsgolf berekenen...',
           progressPercent: 78,
         }));
-      }, 2200);
+      }, 1200);
 
-      // Execute Server API Sync
+      // Execute Server API Sync (handles optional translation or Gemini sync if key is present)
       const response = await fetch('/api/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -454,54 +469,80 @@ export default function App() {
       setProgressState((prev) => ({
         ...prev,
         step: 4,
-        stepLabel: `Ondertitels quantiseren (${targetLanguage === 'nl' ? '_NL' : '_EN'})...`,
-        progressPercent: 96,
+        stepLabel: `Ondertitels op vocale onsets en frasedalen vastzetten (${targetLanguage === 'nl' ? '_NL' : '_EN'})...`,
+        progressPercent: 94,
       }));
 
-      await new Promise((res) => setTimeout(res, 500));
-
       if (data.cues && Array.isArray(data.cues)) {
-        // Double-guard: strictly preserve cue sequence by ID and ensure positive valid durations
-        const clamped = [...data.cues].sort((a, b) => a.id - b.id);
-        const effectiveStart = Math.max(vocalStartTime || 0, data.detectedIntroSilence || 0);
-        if (vocalStartTime === 0 && data.detectedIntroSilence > 0) {
-          setVocalStartTime(Math.round(data.detectedIntroSilence * 10) / 10);
-        }
+        let finalCues: SubtitleCue[] = [...data.cues].sort((a, b) => a.id - b.id);
+        let detectedBreaks = data.detectedBreaks || [];
+        let effectiveStart = Math.max(vocalStartTime || 0, data.detectedIntroSilence || 0);
 
-        // If first cue starts earlier than detected intro, shift all cues forward cleanly
-        if (effectiveStart > 0 && clamped.length > 0 && clamped[0].startTime < effectiveStart - 0.5) {
-          const shiftDelta = Math.round((effectiveStart - clamped[0].startTime) * 100) / 100;
-          for (const c of clamped) {
-            c.startTime = Math.round((c.startTime + shiftDelta) * 100) / 100;
-            c.endTime = Math.round((c.endTime + shiftDelta) * 100) / 100;
+        // If server ran without external Gemini API key (cadence-alignment-engine) and we have the audio,
+        // run our full local Whisper AI speech recognition & word-level forced aligner!
+        if (audioBlob && (!data.source || data.source === 'cadence-alignment-engine')) {
+          const pairsForWhisper = finalCues.map((c) => ({
+            id: c.id,
+            text: c.text,
+            originalText: c.originalText,
+          }));
+
+          try {
+            const whisperResult = await runLocalWhisperAlignment(
+              audioBlob,
+              pairsForWhisper,
+              audioDuration,
+              (targetLanguage || 'en') === 'nl' ? 'nl' : 'en',
+              (percent, statusText) => {
+                setProgressState((prev) => ({
+                  ...prev,
+                  step: 3,
+                  stepLabel: statusText,
+                  progressPercent: percent,
+                }));
+              }
+            );
+
+            if (whisperResult.cues.length > 0) {
+              finalCues = whisperResult.cues;
+              detectedBreaks = whisperResult.detectedBreaks;
+              effectiveStart = whisperResult.detectedIntroSilence;
+            }
+          } catch (whisperErr: any) {
+            console.warn('Whisper alignment error, falling back to acoustic aligner:', whisperErr);
+            // Fallback to acoustic DSP aligner if Web Worker has an issue
+            const pairsForAcoustic = finalCues.map((c) => ({
+              id: c.id,
+              original: c.originalText || c.text,
+              translated: c.text,
+            }));
+            const acousticResult = await alignLyricsToAudioAcoustically(
+              audioBlob,
+              rawLyricsWithStructure,
+              pairsForAcoustic,
+              vocalStartTime || 0
+            );
+            if (acousticResult.cues.length > 0) {
+              finalCues = acousticResult.cues;
+              detectedBreaks = acousticResult.detectedBreaks;
+              effectiveStart = Math.max(vocalStartTime || 0, acousticResult.detectedIntroSilence || 0);
+            }
           }
         }
 
-        let lastEnd = effectiveStart;
-        for (let i = 0; i < clamped.length; i++) {
-          const cue = clamped[i];
-          const next = clamped[i + 1];
-          const naturalVocalDuration = Math.max(2.4, Math.min(8.5, 1.8 + cue.text.length * 0.14));
-
-          if (cue.startTime < lastEnd) {
-            cue.startTime = Math.round(lastEnd * 100) / 100;
-          }
-          if (cue.endTime - cue.startTime > 9.5 || cue.endTime <= cue.startTime) {
-            cue.endTime = Math.round((cue.startTime + naturalVocalDuration) * 100) / 100;
-          }
-          if (next && next.startTime > cue.startTime && cue.endTime > next.startTime) {
-            cue.endTime = Math.max(cue.startTime + 1.2, Math.round((next.startTime - 0.15) * 100) / 100);
-          }
-          lastEnd = cue.endTime + 0.15;
+        if (vocalStartTime === 0 && effectiveStart >= 1.5) {
+          setVocalStartTime(Math.round(effectiveStart * 10) / 10);
         }
-        setCues(clamped);
-        setSelectedCueId(clamped[0]?.id || null);
 
-        const breaksNotice = data.detectedBreaks && data.detectedBreaks.length > 0
-          ? ` (${data.detectedBreaks.length} instrumentale breaks behouden)`
-          : '';
+        setCues(finalCues);
+        setSelectedCueId(finalCues[0]?.id || null);
+
+        const breaksNotice =
+          detectedBreaks && detectedBreaks.length > 0
+            ? ` (${detectedBreaks.length} instrumentale pauzes/breaks herkend)`
+            : '';
         showToast(
-          `Succesvol ${clamped.length} ${data.translated ? 'vertaalde en ' : ''}gesynchroniseerde regels gegenereerd${breaksNotice}!`,
+          `Succesvol ${finalCues.length} ${data.translated ? 'vertaalde en ' : ''}akoestisch uitgelijnde regels gegenereerd${breaksNotice}!`,
           'success'
         );
       }

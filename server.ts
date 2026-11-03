@@ -395,18 +395,100 @@ async function startServer() {
   app.use(express.json({ limit: '60mb' }));
   app.use(express.urlencoded({ extended: true, limit: '60mb' }));
 
-  // Initialize shared Gemini instance
-  const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+  // Initialize shared Gemini instance only if API key is provided
+  const hasGeminiKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim());
+  const ai = hasGeminiKey
+    ? new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      })
+    : null;
+
+  const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
+  const PREFERRED_OLLAMA_MODELS = [
+    'llama3.1:8b',
+    'dolphin3:8b-llama3.1-q4_K_M',
+    'cognitivecomputations/dolphin-llama3.1:8b',
+    'qwen2.5-coder:7b',
+    'deepseek-coder:6.7b',
+  ];
+
+  async function getLocalOllamaModel(): Promise<string | null> {
+    try {
+      const res = await fetch(`${OLLAMA_HOST}/api/tags`, { signal: AbortSignal.timeout(2500) });
+      if (!res.ok) return null;
+      const data: any = await res.json();
+      const installed: string[] = (data.models || []).map((m: any) => String(m.name));
+      if (installed.length === 0) return null;
+      for (const pref of PREFERRED_OLLAMA_MODELS) {
+        if (installed.includes(pref)) return pref;
+      }
+      return installed[0];
+    } catch {
+      return null;
+    }
+  }
+
+  function extractJsonArray(parsed: any): any[] {
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === 'object') {
+      for (const key of Object.keys(parsed)) {
+        if (Array.isArray(parsed[key])) {
+          return parsed[key];
+        }
+      }
+    }
+    return [];
+  }
+
+  async function generateJsonWithLocalOllama(prompt: string, temperature = 0.25): Promise<any> {
+    const model = await getLocalOllamaModel();
+    if (!model) {
+      throw new Error('Geen lokaal Ollama-model gevonden op 127.0.0.1:11434');
+    }
+    console.log(`[Local Ollama] Executing prompt with local model: ${model}...`);
+    const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are an expert bilingual Dutch/English music lyric translator and subtitle editor. Always respond with valid JSON only.',
+          },
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+        format: 'json',
+        stream: false,
+        options: {
+          temperature,
+        },
+      }),
+      signal: AbortSignal.timeout(90000),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Ollama HTTP ${res.status}`);
+    }
+    const data: any = await res.json();
+    const rawContent = data?.message?.content?.trim() || '{}';
+    return JSON.parse(rawContent);
+  }
 
   // Resilient API execution with per-attempt timeout and backoff retry
   async function generateWithRetry(request: any, maxRetries = 2, timeoutMs = 60000) {
+    if (!ai) {
+      throw new Error('No Gemini API key configured');
+    }
     let lastErr: any = null;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       let timer: NodeJS.Timeout | null = null;
@@ -432,7 +514,6 @@ async function startServer() {
           msg.includes('high demand') ||
           msg.includes('UNAVAILABLE') ||
           msg.includes('RESOURCE_EXHAUSTED');
-        // If a model timed out or is in high demand (503), fail over immediately to the next candidate model
         if (isTimeout || isHighDemand) {
           throw err;
         }
@@ -448,10 +529,13 @@ async function startServer() {
   }
 
   // Health check API
-  app.get('/api/health', (_req, res) => {
+  app.get('/api/health', async (_req, res) => {
+    const ollamaModel = await getLocalOllamaModel();
     res.json({
       status: 'ok',
-      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+      hasApiKey: hasGeminiKey,
+      localOllamaModel: ollamaModel,
+      mode: hasGeminiKey ? 'gemini' : ollamaModel ? `local-ollama (${ollamaModel})` : 'local-acoustic',
     });
   });
 
@@ -593,72 +677,107 @@ STRIKTE RICHTLIJNEN OM VERTAALFOUTEN TE VOORKOMEN:
 Volledige Songtekst (${sourceLangName}) - ${cleanLines.length} regels:
 ${indexedLyrics}
 
-Retourneer een valide JSON-array van objecten met het exacte schema:
-[
-  { "id": 1, "original": "...", "translated": "..." }
-]`;
+Retourneer een valide JSON-object met een "pairs" array met daarin exact ${cleanLines.length} objecten:
+{
+  "pairs": [
+    { "id": 1, "original": "...", "translated": "..." }
+  ]
+}`;
 
-    const candidateModels = CANDIDATE_MODELS;
+    const reconcileParsedPairs = (parsedArray: any[]) => {
+      if (!Array.isArray(parsedArray) || parsedArray.length === 0) return null;
+      const resultPairs: { id: number; original: string; translated: string }[] = [];
+      for (let i = 0; i < cleanLines.length; i++) {
+        const lineId = i + 1;
+        const originalLine = cleanLines[i];
+        const found = parsedArray.find((p: any) => p && Number(p.id) === lineId) || parsedArray[i];
+        let translatedLine =
+          found && (found.translated || found.translation || found.text)
+            ? String(found.translated || found.translation || found.text).replace(/\[.*?\]/g, '').trim()
+            : '';
+
+        if (!translatedLine) {
+          translatedLine = originalLine;
+        }
+
+        resultPairs.push({
+          id: lineId,
+          original: originalLine,
+          translated: translatedLine,
+        });
+      }
+      return resultPairs;
+    };
+
     let lastError: any = null;
 
-    for (const modelName of candidateModels) {
+    // 1. Try Local Ollama first if no Gemini API key is configured (or as fallback)
+    if (!hasGeminiKey) {
       try {
-        console.log(`[API /api/translate] Invoking translation model ${modelName} (${cleanLines.length} lines, style: ${style})...`);
-        const response = await generateWithRetry({
-          model: modelName,
-          contents: prompt,
-          config: {
-            temperature: style === 'singable' ? 0.35 : 0.25,
-            maxOutputTokens: 8192,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.ARRAY,
-              description: 'Carefully translated lyrics without section tags',
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.INTEGER },
-                  original: { type: Type.STRING, description: 'Original clean line' },
-                  translated: { type: Type.STRING, description: 'Natural, flawless translated line' },
-                },
-                required: ['id', 'original', 'translated'],
-              },
-            },
-          },
-        });
-
-        const raw = response.text?.trim() || '';
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          // Reconcile and guarantee 100% of input lines are represented
-          const resultPairs: { id: number; original: string; translated: string }[] = [];
-          for (let i = 0; i < cleanLines.length; i++) {
-            const lineId = i + 1;
-            const originalLine = cleanLines[i];
-            const found = parsed.find((p: any) => p && p.id === lineId) || parsed[i];
-            let translatedLine = found && found.translated
-              ? String(found.translated).replace(/\[.*?\]/g, '').trim()
-              : '';
-
-            if (!translatedLine) {
-              translatedLine = originalLine;
-            }
-
-            resultPairs.push({
-              id: lineId,
-              original: originalLine,
-              translated: translatedLine,
-            });
-          }
-          return resultPairs;
+        const ollamaRaw = await generateJsonWithLocalOllama(prompt, style === 'singable' ? 0.35 : 0.2);
+        const arr = extractJsonArray(ollamaRaw);
+        const reconciled = reconcileParsedPairs(arr);
+        if (reconciled) {
+          return reconciled;
         }
-      } catch (err: any) {
-        console.warn(`[API /api/translate] Model ${modelName} warning:`, err?.message?.substring(0, 150));
-        lastError = err;
+      } catch (ollamaErr: any) {
+        console.warn('[API /api/translate] Local Ollama warning:', ollamaErr?.message);
+        lastError = ollamaErr;
       }
     }
 
-    throw lastError || new Error('Er kon geen verbinding worden gemaakt met de AI-vertaalservice.');
+    // 2. If Gemini API Key is present, try Gemini models
+    if (hasGeminiKey) {
+      for (const modelName of CANDIDATE_MODELS) {
+        try {
+          console.log(`[API /api/translate] Invoking translation model ${modelName} (${cleanLines.length} lines, style: ${style})...`);
+          const response = await generateWithRetry({
+            model: modelName,
+            contents: prompt,
+            config: {
+              temperature: style === 'singable' ? 0.35 : 0.25,
+              maxOutputTokens: 8192,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.ARRAY,
+                description: 'Carefully translated lyrics without section tags',
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.INTEGER },
+                    original: { type: Type.STRING, description: 'Original clean line' },
+                    translated: { type: Type.STRING, description: 'Natural, flawless translated line' },
+                  },
+                  required: ['id', 'original', 'translated'],
+                },
+              },
+            },
+          });
+
+          const raw = response.text?.trim() || '';
+          const parsed = extractJsonArray(JSON.parse(raw));
+          const reconciled = reconcileParsedPairs(parsed);
+          if (reconciled) {
+            return reconciled;
+          }
+        } catch (err: any) {
+          console.warn(`[API /api/translate] Model ${modelName} warning:`, err?.message?.substring(0, 150));
+          lastError = err;
+        }
+      }
+
+      // Fallback to Local Ollama if Gemini failed
+      try {
+        const ollamaRaw = await generateJsonWithLocalOllama(prompt, style === 'singable' ? 0.35 : 0.2);
+        const arr = extractJsonArray(ollamaRaw);
+        const reconciled = reconcileParsedPairs(arr);
+        if (reconciled) {
+          return reconciled;
+        }
+      } catch (_) {}
+    }
+
+    throw lastError || new Error('Er kon geen verbinding worden gemaakt met de lokale Ollama AI-service.');
   }
 
   // Standalone Translation Endpoint
@@ -685,17 +804,13 @@ Retourneer een valide JSON-array van objecten met het exacte schema:
         });
       }
 
-      if (!process.env.GEMINI_API_KEY) {
-        return res.status(500).json({ error: 'Geen GEMINI_API_KEY geconfigureerd op de server.' });
-      }
-
       try {
         const pairs = await translateLyricsPoetically(cleanLines.join('\n'), sourceLanguage, targetLanguage, style);
         return res.json({ success: true, pairs, style });
       } catch (genAiError: any) {
         console.error('[API /api/translate] Translation error:', genAiError?.message);
         return res.status(503).json({
-          error: 'De AI-vertaalservice kon deze songtekst niet voltooien. Klik op "Opnieuw" om het direct opnieuw te proberen.',
+          error: 'De lokale AI-vertaalservice (Ollama) kon niet worden bereikt. Zorg dat Ollama op de achtergrond draait.',
         });
       }
     } catch (err: any) {
@@ -713,10 +828,6 @@ Retourneer een valide JSON-array van objecten met het exacte schema:
         return res.status(400).json({ error: 'Geen vertaalde regels ontvangen om te verbeteren.' });
       }
 
-      if (!process.env.GEMINI_API_KEY) {
-        return res.status(500).json({ error: 'Geen GEMINI_API_KEY geconfigureerd.' });
-      }
-
       const targetLangName = targetLanguage === 'nl' ? 'Nederlands' : 'Engels';
       const prompt = `Je bent een meesterlijke eindredacteur en bekroond vertaler van liedteksten.
 De gebruiker merkt op dat de huidige vertaling taalfouten, onnatuurlijke zinswendingen of houterige formuleringen bevat.
@@ -730,39 +841,53 @@ Loop elke vertaalde regel grondig na en verbeter deze:
 Huidige paren:
 ${JSON.stringify(pairs, null, 2)}
 
-Retourneer de verbeterde JSON array met id, original en translated.`;
+Retourneer een JSON-object met een "pairs" array met id, original en translated.`;
 
-      const candidateModels = CANDIDATE_MODELS;
-      for (const modelName of candidateModels) {
+      if (!hasGeminiKey) {
         try {
-          const response = await generateWithRetry({
-            model: modelName,
-            contents: prompt,
-            config: {
-              temperature: 0.2,
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.ARRAY,
-                description: 'Improved translated lyrics pairs',
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.INTEGER },
-                    original: { type: Type.STRING },
-                    translated: { type: Type.STRING },
-                  },
-                  required: ['id', 'original', 'translated'],
-                },
-              },
-            },
-          });
-
-          const parsed = JSON.parse(response.text?.trim() || '[]');
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            return res.json({ success: true, pairs: parsed });
+          const ollamaRaw = await generateJsonWithLocalOllama(prompt, 0.2);
+          const arr = extractJsonArray(ollamaRaw);
+          if (arr.length > 0) {
+            return res.json({ success: true, pairs: arr });
           }
         } catch (e: any) {
-          // Continue to next model
+          console.warn('[API /api/improve-translation] Local Ollama warning:', e?.message);
+        }
+      }
+
+      if (hasGeminiKey) {
+        const candidateModels = CANDIDATE_MODELS;
+        for (const modelName of candidateModels) {
+          try {
+            const response = await generateWithRetry({
+              model: modelName,
+              contents: prompt,
+              config: {
+                temperature: 0.2,
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.ARRAY,
+                  description: 'Improved translated lyrics pairs',
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.INTEGER },
+                      original: { type: Type.STRING },
+                      translated: { type: Type.STRING },
+                    },
+                    required: ['id', 'original', 'translated'],
+                  },
+                },
+              },
+            });
+
+            const parsed = extractJsonArray(JSON.parse(response.text?.trim() || '[]'));
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              return res.json({ success: true, pairs: parsed });
+            }
+          } catch (e: any) {
+            // Continue to next model
+          }
         }
       }
 
@@ -810,38 +935,52 @@ Genereer exact 3 gevarieerde alternatieven:
 2. 'singable': Ritmisch en zingbaar (passend bij het metrum van de melodie)
 3. 'poetic': Poëtisch en beeldend (artistiek en literair)
 
-Retourneer een JSON array van 3 objecten met 'style', 'label' en 'text'.`;
+Retourneer een JSON-object met een "options" array van 3 objecten met 'style', 'label' en 'text'.`;
 
-      const candidateModels = CANDIDATE_MODELS;
-      for (const modelName of candidateModels) {
+      if (!hasGeminiKey) {
         try {
-          const response = await generateWithRetry({
-            model: modelName,
-            contents: prompt,
-            config: {
-              temperature: 0.4,
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    style: { type: Type.STRING, enum: ['natural', 'singable', 'poetic'] },
-                    label: { type: Type.STRING },
-                    text: { type: Type.STRING },
-                  },
-                  required: ['style', 'label', 'text'],
-                },
-              },
-            },
-          });
-
-          const parsed = JSON.parse(response.text?.trim() || '[]');
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            return res.json({ success: true, options: parsed });
+          const ollamaRaw = await generateJsonWithLocalOllama(prompt, 0.4);
+          const arr = extractJsonArray(ollamaRaw);
+          if (arr.length > 0) {
+            return res.json({ success: true, options: arr });
           }
         } catch (e: any) {
-          // Try next model
+          console.warn('[API /api/rephrase-line] Local Ollama warning:', e?.message);
+        }
+      }
+
+      if (hasGeminiKey) {
+        const candidateModels = CANDIDATE_MODELS;
+        for (const modelName of candidateModels) {
+          try {
+            const response = await generateWithRetry({
+              model: modelName,
+              contents: prompt,
+              config: {
+                temperature: 0.4,
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      style: { type: Type.STRING, enum: ['natural', 'singable', 'poetic'] },
+                      label: { type: Type.STRING },
+                      text: { type: Type.STRING },
+                    },
+                    required: ['style', 'label', 'text'],
+                  },
+                },
+              },
+            });
+
+            const parsed = extractJsonArray(JSON.parse(response.text?.trim() || '[]'));
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              return res.json({ success: true, options: parsed });
+            }
+          } catch (e: any) {
+            // Try next model
+          }
         }
       }
 
@@ -917,36 +1056,52 @@ Geef het resultaat terug in een JSON object met 'alignedLines' array van precies
       const candidateModels = CANDIDATE_MODELS;
       let alignedResult: string[] | null = null;
 
-      for (const modelName of candidateModels) {
+      if (!hasGeminiKey) {
         try {
-          const response = await generateWithRetry({
-            model: modelName,
-            contents: prompt,
-            config: {
-              temperature: 0.2,
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  alignedLines: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: `Array van precies ${cleanSourceLines.length} regels`,
-                  },
-                },
-                required: ['alignedLines'],
-              },
-            },
-          });
-
-          const rawText = response.text?.trim() || '{}';
-          const parsed = JSON.parse(rawText);
-          if (Array.isArray(parsed.alignedLines) && parsed.alignedLines.length === cleanSourceLines.length) {
-            alignedResult = parsed.alignedLines.map((l: any) => String(l).replace(/\[.*?\]/g, '').trim());
-            break;
+          const ollamaRaw = await generateJsonWithLocalOllama(prompt, 0.2);
+          const arr = Array.isArray(ollamaRaw?.alignedLines)
+            ? ollamaRaw.alignedLines
+            : extractJsonArray(ollamaRaw);
+          if (Array.isArray(arr) && arr.length === cleanSourceLines.length) {
+            alignedResult = arr.map((l: any) => String(l).replace(/\[.*?\]/g, '').trim());
           }
         } catch (e: any) {
-          console.warn(`[API /api/realign-lines] Model ${modelName} warning:`, e?.message?.substring(0, 150));
+          console.warn('[API /api/realign-lines] Local Ollama warning:', e?.message);
+        }
+      }
+
+      if (hasGeminiKey && !alignedResult) {
+        for (const modelName of candidateModels) {
+          try {
+            const response = await generateWithRetry({
+              model: modelName,
+              contents: prompt,
+              config: {
+                temperature: 0.2,
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    alignedLines: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                      description: `Array van precies ${cleanSourceLines.length} regels`,
+                    },
+                  },
+                  required: ['alignedLines'],
+                },
+              },
+            });
+
+            const rawText = response.text?.trim() || '{}';
+            const parsed = JSON.parse(rawText);
+            if (Array.isArray(parsed.alignedLines) && parsed.alignedLines.length === cleanSourceLines.length) {
+              alignedResult = parsed.alignedLines.map((l: any) => String(l).replace(/\[.*?\]/g, '').trim());
+              break;
+            }
+          } catch (e: any) {
+            console.warn(`[API /api/realign-lines] Model ${modelName} warning:`, e?.message?.substring(0, 150));
+          }
         }
       }
 
@@ -1038,8 +1193,8 @@ Geef het resultaat terug in een JSON object met 'alignedLines' array van precies
           original: String(p.original || '').replace(/\[.*?\]/g, '').trim(),
           translated: String(p.translated || '').replace(/\[.*?\]/g, '').trim(),
         }));
-      } else if (isTranslationNeeded && process.env.GEMINI_API_KEY) {
-        // Otherwise perform careful translation with Gemini 3.8 Flash
+      } else if (isTranslationNeeded) {
+        // Otherwise perform careful translation (via local Ollama or Gemini)
         try {
           console.log(`[API /api/sync] Step 1: Translating lyrics from ${effectiveSourceLang} to ${effectiveTargetLang} (style: ${style})...`);
           pairs = await translateLyricsPoetically(cleanLines.join('\n'), effectiveSourceLang, effectiveTargetLang, style);

@@ -7,4 +7,7 @@ coverage/
 .env*
 !.env.example
 .aistudio/
+# Large local AI model files (re-download with: npm run download-model)
+public/models/
+public/ort/
 
