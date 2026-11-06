@@ -327,8 +327,7 @@ function mergeTimingsWithPairs(
     const pair = pairs[i];
     const timing = timingMap.get(pair.id);
     const lineLen = (pair.original || pair.translated).length;
-    // Realistic natural singing duration (~2.5s - 3.8s for typical lyric lines, never 5.5s-6.5s)
-    const naturalDur = Math.max(1.85, Math.min(4.2, 1.1 + lineLen * 0.068));
+    const naturalDur = Math.max(2.4, Math.min(7.5, 1.6 + lineLen * 0.12));
 
     let start: number;
     let end: number;
@@ -336,20 +335,19 @@ function mergeTimingsWithPairs(
     if (timing && timing.startTime >= lastStart + 0.85) {
       // Honor AI startTime directly without snowballing forward drift from previous endTime!
       // If the previous cue's endTime extended past this cue's startTime, trim the previous cue's endTime.
-      if (resultCues.length > 0 && resultCues[resultCues.length - 1].endTime > timing.startTime - 0.10) {
+      if (resultCues.length > 0 && resultCues[resultCues.length - 1].endTime > timing.startTime - 0.12) {
         const prev = resultCues[resultCues.length - 1];
         prev.endTime = Math.max(
-          Math.round((prev.startTime + 1.25) * 100) / 100,
+          Math.round((prev.startTime + 1.4) * 100) / 100,
           Math.round((timing.startTime - 0.12) * 100) / 100
         );
-        lastEnd = prev.endTime + 0.10;
+        lastEnd = prev.endTime + 0.12;
       }
 
-      start = Math.max(i === 0 ? vocalStartTime : lastStart + 1.1, timing.startTime);
-      const rawAiDur = timing.endTime - timing.startTime;
-      // Prevent AI from artificially stretching a 3s phrase to 5.5s across breath pauses
-      const maxPhraseDur = Math.max(3.8, naturalDur * 1.38);
-      const cueDur = Math.max(1.65, Math.min(maxPhraseDur, rawAiDur));
+      start = Math.max(i === 0 ? vocalStartTime : lastStart + 1.0, timing.startTime);
+      // Add +0.35s post-vocal sustain tail ("stem ijlt nog even door") so subtitles never cut off abruptly
+      const rawAiDur = timing.endTime - timing.startTime + 0.35;
+      const cueDur = Math.max(2.1, Math.min(9.0, rawAiDur));
       end = Math.round((start + cueDur) * 100) / 100;
     } else {
       // Find next upcoming AI anchor further down the song if one exists
@@ -357,7 +355,7 @@ function mergeTimingsWithPairs(
       let stepsToNext = 0;
       for (let j = i + 1; j < pairs.length; j++) {
         const nextTiming = timingMap.get(pairs[j].id);
-        if (nextTiming && nextTiming.startTime > lastEnd + 1.2) {
+        if (nextTiming && nextTiming.startTime > lastEnd + 1.5) {
           nextAnchorTime = nextTiming.startTime;
           stepsToNext = j - i;
           break;
@@ -366,15 +364,15 @@ function mergeTimingsWithPairs(
 
       if (nextAnchorTime !== null && stepsToNext > 0) {
         const available = Math.max(1.0, nextAnchorTime - lastEnd);
-        const reservedSoloGap = available > 14 ? available * 0.45 : 0;
+        const reservedSoloGap = available > 18 ? available * 0.5 : 0;
         const availableForSinging = available - reservedSoloGap;
         const slot = availableForSinging / (stepsToNext + 1);
-        start = Math.round((lastEnd + Math.max(0.15, Math.min(0.45, slot * 0.12))) * 100) / 100;
-        const dur = Math.max(1.65, Math.min(naturalDur, slot * 0.78));
+        start = Math.round((lastEnd + Math.max(0.15, slot * 0.08)) * 100) / 100;
+        const dur = Math.max(2.0, Math.min(naturalDur, slot * 0.88));
         end = Math.round((start + dur) * 100) / 100;
       } else {
-        // Space remaining cues with natural singing duration and breath pause
-        start = Math.round((lastEnd + 0.30) * 100) / 100;
+        // Space remaining cues smoothly after lastEnd
+        start = Math.round((lastEnd + 0.25) * 100) / 100;
         end = Math.round((start + naturalDur) * 100) / 100;
       }
     }
@@ -1239,17 +1237,17 @@ Geef het resultaat terug in een JSON object met 'alignedLines' array van precies
         const processedAudio = await processAudioForAiAndAcoustics(audioBase64, cleanMime);
         effectiveVocalStart = Math.max(effectiveVocalStart, processedAudio.detectedIntroSilence);
 
-        // Merge server FFmpeg breaks with browser Web Audio DSP breaks
+        // Only include genuine long instrumental solos/breaks (>= 6.0s) so normal 2-4s breath pauses never push cues
         const mergedBreaks: AcousticBreak[] = [
-          ...processedAudio.detectedBreaks,
+          ...processedAudio.detectedBreaks.filter((b) => b.end - b.start >= 6.0),
           ...(Array.isArray(clientDetectedBreaks)
             ? clientDetectedBreaks.filter(
                 (cb: any) =>
                   cb &&
                   typeof cb.start === 'number' &&
                   typeof cb.end === 'number' &&
-                  cb.end - cb.start >= 2.0 &&
-                  !processedAudio.detectedBreaks.some((sb) => Math.abs(sb.start - cb.start) < 1.5)
+                  cb.end - cb.start >= 6.0 &&
+                  !processedAudio.detectedBreaks.some((sb) => Math.abs(sb.start - cb.start) < 2.0)
               )
             : []),
         ].sort((a, b) => a.start - b.start);
@@ -1272,22 +1270,11 @@ Geef het resultaat terug in een JSON object met 'alignedLines' array van precies
 
         const breaksNotice =
           mergedBreaks.length > 0
-            ? `ACOUSTICALLY DETECTED INSTRUMENTAL BREAKS & INTER-VERSE PAUSES:
-The audio waveform has the following intervals where NO vocal singing is present (e.g. guitar solos, piano passages, inter-verse breaths):
+            ? `ACOUSTICALLY DETECTED INSTRUMENTAL SOLOS & LONG BREAKS (>= 6s):
+The audio signal has the following long instrumental intervals where NO vocal singing is present:
 ${mergedBreaks.map((b) => `- Break from ${Number(b.start).toFixed(2)}s to ${Number(b.end).toFixed(2)}s (Duration: ${Number(b.duration).toFixed(2)}s)`).join('\n')}
-CRITICAL: DO NOT place or stretch any subtitle cue into these intervals! Cues before the break must end at or before the start of the break. Cues after the break must start at or after the end of the break!`
+CRITICAL: DO NOT place any subtitle cue inside these long instrumental breaks!`
             : 'Listen closely for any instrumental guitar/synth solos or pauses where no singing occurs.';
-
-        const phrasesNotice =
-          Array.isArray(clientAcousticPhrases) && clientAcousticPhrases.length > 0
-            ? `\nMEASURED VOCAL WAVEFORM PHRASE ISLANDS (280Hz-3400Hz Vocal Bandpass Envelope):
-The audio waveform contains discrete bursts of vocal energy at these exact timestamp intervals:
-${clientAcousticPhrases
-  .slice(0, 80)
-  .map((ph: any, idx: number) => `  [Wave #${idx + 1}] ${Number(ph.start).toFixed(2)}s -> ${Number(ph.end).toFixed(2)}s (${Number(ph.duration).toFixed(2)}s)`)
-  .join('\n')}
-CRITICAL: Anchor each lyric line's startTime and endTime directly onto the corresponding vocal waveform island(s) where that line is sung!`
-            : '';
 
         const prompt = `You are an expert audio sound engineer and music lyric timing specialist.
 Analyze this audio recording and the exact song vocal cues provided below in sequential order.
@@ -1305,26 +1292,26 @@ ${effectiveVocalStart > 0 ? `- The musical audio track begins with an instrument
 - Under NO circumstance should any cue begin before ${effectiveVocalStart.toFixed(1)} seconds!` : `- Listen carefully to the start of the audio: if an acoustic guitar or musical intro plays for 21 seconds before the first sung words, Cue #1 MUST start at ~21 seconds, NEVER at 0 seconds!`}
 
 ${breaksNotice}
-${phrasesNotice}
 
 CRITICAL RULES:
 1. Every cue (#1 to #${pairs.length}) must appear in sequential order as a subtitle cue.
    - TOTAL CUE COUNT: There are EXACTLY ${pairs.length} cues.
    - You MUST output timings for ALL ${pairs.length} cues from #1 all the way to #${pairs.length}.
    - Do NOT stop early, and do NOT truncate or omit cues near the end of the song!
-2. Provide 'startTime' and 'endTime' for each cue in TOTAL SECONDS as floating point numbers with 0.05s precision (e.g. 42.60).
+2. Provide 'startTime' and 'endTime' for each cue in TOTAL SECONDS as floating point numbers with 0.05s precision (e.g. 42.55).
    CRITICAL MINUTE-TO-SECOND CONVERSION:
    - Always calculate seconds as: minutes * 60 + seconds.
    - Example: 1 minute 07 seconds is 67.0 seconds (NEVER write 107 seconds!).
    - Example: 1 minute 16 seconds is 76.0 seconds (NEVER write 116 seconds!).
    - Example: 1 minute 47 seconds is 107.0 seconds.
    - Example: 2 minutes 14 seconds is 134.0 seconds (NEVER write 214 seconds!).
-3. EXACT VALLEY-TO-VALLEY PHRASE BOUNDARIES (DO NOT OVER-STRETCH CUES!):
-   - 'startTime' MUST be the exact moment the singer begins the VERY FIRST word/syllable of the line (as the waveform rises out of the breath valley), NOT late on the second stressed word!
-   - 'endTime' MUST be the exact moment the singer finishes the LAST word/vowel of the line and drops into the breath pause/valley!
-   - A normal 6-to-9 word sung lyric line typically lasts **2.3 to 3.8 seconds** (NEVER divide total song duration by cue count and NEVER output uniform 5.5s blocks!).
-   - DO NOT stretch 'endTime' across breath pauses or inter-verse pauses to touch the next cue! When the singer finishes a line at 45.85s and starts the next line at 46.25s (or 49.50s), set 'endTime' to 45.85s and leave the pause empty!
-   - Subtitles must wrap tightly around their own vocal waveform mountain from onset valley to offset valley.
+3. EXACT VOCAL ONSET, SUSTAIN & REVERB TAIL ("STEM IJLT NOG EVEN DOOR"):
+   - EXACT START ('startTime'): Place 'startTime' at the VERY FIRST audible onset/consonant of the first word of the line (as the singer's voice rises out of the breath valley, ~0.10s before the first stressed beat). Do NOT start late on the second word!
+   - COMPLETE PHRASE COVERAGE: Many sung lines have a short breath or caesura in the middle of the sentence (e.g. "The heavy steps ... of guilt and fear"). Ensure the single cue covers the ENTIRE sentence from the first word ("The") all the way through the last word ("fear")!
+   - VOCAL SUSTAIN & DECAY TAIL ('endTime'): Singers often hold the final vowel/note of a line and their voice echoes/reverberates ("ijlt nog even door"). NEVER cut off 'endTime' while the singer's voice is still sustaining or decaying! Set 'endTime' AFTER the final sung note and its vocal reverb tail have completely faded out into the valley (plus ~0.35s-0.45s comfortable reading hold, or up to ~0.15s before the next line's vocal attack).
+   - DURING A LONG INSTRUMENTAL SOLO/BREAK, NO ONE IS SINGING:
+     * DO NOT place any subtitle cues during an instrumental solo! Leave a genuine empty gap after the previous cue's vocal tail fades out until the singer resumes singing after the solo.
+   - 'endTime - startTime' typically ranges from 2.2 to 8.5 seconds depending on tempo and vocal sustain.
 4. Ensure 'startTime' < 'endTime' for all cues, and consecutive cues must not regress backwards.
 5. NEVER output [Verse], [Chorus], or any bracketed annotations.
 6. Return a valid JSON array of objects with keys:
@@ -1334,7 +1321,7 @@ CRITICAL RULES:
 
         for (const modelName of candidateModels) {
           try {
-            console.log(`[API /api/sync] Invoking alignment with model ${modelName} (${pairs.length} cues, intro: ${effectiveVocalStart.toFixed(1)}s, ${mergedBreaks.length} breaks, ${Array.isArray(clientAcousticPhrases) ? clientAcousticPhrases.length : 0} wave islands)...`);
+            console.log(`[API /api/sync] Invoking alignment with model ${modelName} (${pairs.length} cues, intro: ${effectiveVocalStart.toFixed(1)}s, ${mergedBreaks.length} breaks)...`);
             const audioPart = {
               inlineData: {
                 mimeType: processedAudio.mimeType,
