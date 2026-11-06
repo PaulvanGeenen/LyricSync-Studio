@@ -106,7 +106,7 @@ export function alignWhisperWordsToLyricLines(
     .sort((a, b) => a.start - b.start);
 
   const lineWords = lyricLines.map((line) => {
-    return line.text
+    return (line.originalText || line.text)
       .split(/\s+/)
       .map(normalizeWord)
       .filter((w) => w.length > 0);
@@ -239,7 +239,7 @@ export function alignWhisperWordsToLyricLines(
 
   for (let i = 0; i < spans.length; i++) {
     const span = spans[i];
-    const naturalDur = Math.max(2.0, Math.min(7.5, 1.4 + span.text.length * 0.12));
+    const naturalDur = Math.max(1.85, Math.min(4.2, 1.1 + (span.originalText || span.text).length * 0.068));
 
     if (span.startTime >= 0 && span.startTime >= lastEnd - 0.2) {
       // Anchored by Whisper!

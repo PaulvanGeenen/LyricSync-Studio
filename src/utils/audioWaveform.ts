@@ -737,8 +737,273 @@ export async function alignLyricsToAudioAcoustically(
 }
 
 /**
+ * Synchronous, high-resolution (10ms = 100Hz) Vocal + Visual Envelope & Local Prominence builder.
+ * Combines:
+ * 1. Center-channel lead vocal extraction (mid - 0.22 * side) + 280Hz–3400Hz vocal bandpass filter
+ * 2. True visual peak amplitude (matching what the waveform canvas renders)
+ * 3. Local contrast normalization (`prominence` in 0..1) so breath valleys between phrases are
+ *    detected with sub-10ms precision even when backing instruments are playing.
+ */
+function buildPrecisionEnvelope10ms(audioBuffer: AudioBuffer): {
+  env: Float32Array;
+  prominence: Float32Array;
+  frameCount: number;
+  hopSec: number;
+  totalDuration: number;
+  maxEnergy: number;
+} {
+  const sampleRate = audioBuffer.sampleRate;
+  const totalDuration = audioBuffer.duration;
+  const length = audioBuffer.length;
+  const hopSec = 0.01; // 10ms frames
+  const hopSize = Math.max(1, Math.floor(sampleRate * hopSec));
+  const frameCount = Math.max(1, Math.floor(length / hopSize));
+
+  const left = audioBuffer.getChannelData(0);
+  const right = audioBuffer.numberOfChannels >= 2 ? audioBuffer.getChannelData(1) : null;
+
+  // Fast 1st-order vocal bandpass coefficients (280 Hz highpass + 3400 Hz lowpass)
+  const dt = 1 / sampleRate;
+  const rcHigh = 1 / (2 * Math.PI * 280);
+  const alphaHigh = rcHigh / (rcHigh + dt);
+  const rcLow = 1 / (2 * Math.PI * 3400);
+  const alphaLow = dt / (rcLow + dt);
+
+  const vocalRms = new Float32Array(frameCount);
+  const visualPeak = new Float32Array(frameCount);
+
+  let prevX = 0;
+  let prevHp = 0;
+  let prevLp = 0;
+  let maxVocal = 0.001;
+  let maxVisual = 0.001;
+
+  for (let f = 0; f < frameCount; f++) {
+    const start = f * hopSize;
+    const end = Math.min(length, start + hopSize);
+    let sumSq = 0;
+    let count = 0;
+    let peak = 0;
+
+    for (let i = start; i < end; i += 2) {
+      const l = left[i];
+      const rawAbs = Math.abs(l);
+      if (rawAbs > peak) peak = rawAbs;
+
+      const x = right ? 0.5 * (l + right[i]) - 0.22 * Math.abs(l - right[i]) : l;
+      const hp = alphaHigh * (prevHp + x - prevX);
+      prevX = x;
+      prevHp = hp;
+      const lp = prevLp + alphaLow * (hp - prevLp);
+      prevLp = lp;
+
+      sumSq += lp * lp;
+      count++;
+    }
+
+    const vRms = count > 0 ? Math.sqrt(sumSq / count) : 0;
+    vocalRms[f] = vRms;
+    visualPeak[f] = peak;
+    if (vRms > maxVocal) maxVocal = vRms;
+    if (peak > maxVisual) maxVisual = peak;
+  }
+
+  // Combine normalized vocal-band RMS (65%) + visual canvas peak (35%)
+  const combined = new Float32Array(frameCount);
+  for (let f = 0; f < frameCount; f++) {
+    combined[f] = 0.65 * (vocalRms[f] / maxVocal) + 0.35 * (visualPeak[f] / maxVisual);
+  }
+
+  // 5-frame (50ms) median despike + 5-frame moving average smoothing
+  const despiked = new Float32Array(frameCount);
+  const tmp5 = [0, 0, 0, 0, 0];
+  for (let f = 0; f < frameCount; f++) {
+    for (let k = -2; k <= 2; k++) {
+      const idx = Math.max(0, Math.min(frameCount - 1, f + k));
+      tmp5[k + 2] = combined[idx];
+    }
+    tmp5.sort((a, b) => a - b);
+    despiked[f] = tmp5[2];
+  }
+
+  const env = new Float32Array(frameCount);
+  let maxEnergy = 0.001;
+  for (let f = 0; f < frameCount; f++) {
+    let s = 0;
+    let c = 0;
+    for (let k = -2; k <= 2; k++) {
+      const idx = f + k;
+      if (idx >= 0 && idx < frameCount) {
+        s += despiked[idx];
+        c++;
+      }
+    }
+    const val = c > 0 ? s / c : despiked[f];
+    env[f] = val;
+    if (val > maxEnergy) maxEnergy = val;
+  }
+
+  // Compute local contrast prominence (0..1) over a +-1.6s window
+  // so valleys between vocal phrases drop cleanly toward 0 even with background instruments
+  const prominence = new Float32Array(frameCount);
+  const winRadius = 160; // 1.6s
+  const step = 8; // Compute percentiles every 80ms and interpolate
+  const sampleBuf: number[] = [];
+
+  let prevFloor = 0.02;
+  let prevCeil = 0.5;
+
+  for (let f = 0; f < frameCount; f++) {
+    if (f % step === 0) {
+      sampleBuf.length = 0;
+      const wStart = Math.max(0, f - winRadius);
+      const wEnd = Math.min(frameCount - 1, f + winRadius);
+      for (let j = wStart; j <= wEnd; j += 4) {
+        sampleBuf.push(env[j]);
+      }
+      sampleBuf.sort((a, b) => a - b);
+      prevFloor = sampleBuf[Math.floor(sampleBuf.length * 0.14)] || 0.02;
+      prevCeil = Math.max(prevFloor + 0.06, sampleBuf[Math.floor(sampleBuf.length * 0.88)] || 0.3);
+    }
+
+    if (env[f] < maxEnergy * 0.07) {
+      prominence[f] = 0;
+    } else {
+      const norm = (env[f] - prevFloor) / Math.max(0.05, prevCeil - prevFloor);
+      prominence[f] = Math.max(0, Math.min(1, norm));
+    }
+  }
+
+  return { env, prominence, frameCount, hopSec, totalDuration, maxEnergy };
+}
+
+/**
+ * Extracts measured acoustic vocal phrase islands and instrumental breaks from an AudioBlob.
+ * Used to give the server / Gemini exact millisecond waveform landmarks before alignment.
+ */
+export async function extractAcousticPhraseMap(
+  audioBlob: Blob,
+  userVocalStartTime = 0
+): Promise<{
+  detectedIntroSilence: number;
+  detectedBreaks: { start: number; end: number; duration: number }[];
+  phrases: { start: number; end: number; duration: number }[];
+}> {
+  try {
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    await audioContext.close();
+
+    const { env, prominence, frameCount, hopSec, totalDuration, maxEnergy } =
+      buildPrecisionEnvelope10ms(audioBuffer);
+
+    // 1. Detect vocal intro if not manually specified
+    let effectiveIntro = userVocalStartTime;
+    if (effectiveIntro <= 0.5) {
+      const maxIntroFrame = Math.min(frameCount - 1, Math.floor(Math.min(totalDuration * 0.35, 45) / hopSec));
+      let activeRun = 0;
+      let startCandidate = 0;
+      for (let f = 0; f < maxIntroFrame; f++) {
+        if (prominence[f] >= 0.38 && env[f] >= maxEnergy * 0.16) {
+          if (activeRun === 0) startCandidate = f;
+          activeRun++;
+          if (activeRun >= 85) {
+            // 0.85s of sustained vocal presence
+            let onset = startCandidate;
+            while (onset > 0 && prominence[onset - 1] > 0.16 && startCandidate - onset < 35) {
+              onset--;
+            }
+            effectiveIntro = Math.round(onset * hopSec * 10) / 10;
+            break;
+          }
+        } else {
+          activeRun = 0;
+        }
+      }
+    }
+
+    // 2. Segment into discrete vocal phrase mountains after effectiveIntro
+    const startScanFrame = Math.max(0, Math.floor(effectiveIntro / hopSec));
+    const phrases: { start: number; end: number; duration: number }[] = [];
+    let inPhrase = false;
+    let phraseStartFrame = startScanFrame;
+    let quietFrames = 0;
+
+    for (let f = startScanFrame; f < frameCount; f++) {
+      const isVocal = prominence[f] >= 0.28 && env[f] >= maxEnergy * 0.11;
+      if (!inPhrase) {
+        if (isVocal) {
+          // Walk back up to 250ms to catch the gentle onset rise out of the valley
+          let onset = f;
+          while (onset > startScanFrame && prominence[onset - 1] > 0.15 && f - onset < 25) {
+            onset--;
+          }
+          phraseStartFrame = onset;
+          inPhrase = true;
+          quietFrames = 0;
+        }
+      } else {
+        if (isVocal) {
+          quietFrames = 0;
+        } else {
+          quietFrames++;
+          // A valley of >= 160ms (16 frames) separates distinct vocal phrases
+          if (quietFrames >= 16) {
+            const phraseEndFrame = f - quietFrames + 4; // +40ms vowel decay tail
+            const dur = (phraseEndFrame - phraseStartFrame) * hopSec;
+            if (dur >= 0.9) {
+              phrases.push({
+                start: Math.round(phraseStartFrame * hopSec * 100) / 100,
+                end: Math.round(phraseEndFrame * hopSec * 100) / 100,
+                duration: Math.round(dur * 100) / 100,
+              });
+            }
+            inPhrase = false;
+            quietFrames = 0;
+          }
+        }
+      }
+    }
+
+    if (inPhrase) {
+      const dur = (frameCount - 1 - phraseStartFrame) * hopSec;
+      if (dur >= 0.9) {
+        phrases.push({
+          start: Math.round(phraseStartFrame * hopSec * 100) / 100,
+          end: Math.round((frameCount - 1) * hopSec * 100) / 100,
+          duration: Math.round(dur * 100) / 100,
+        });
+      }
+    }
+
+    // 3. Extract instrumental breaks / inter-verse pauses (>= 2.2s between vocal phrases)
+    const detectedBreaks: { start: number; end: number; duration: number }[] = [];
+    for (let i = 0; i < phrases.length - 1; i++) {
+      const gap = phrases[i + 1].start - phrases[i].end;
+      if (gap >= 2.2) {
+        detectedBreaks.push({
+          start: phrases[i].end,
+          end: phrases[i + 1].start,
+          duration: Math.round(gap * 100) / 100,
+        });
+      }
+    }
+
+    return {
+      detectedIntroSilence: effectiveIntro,
+      detectedBreaks,
+      phrases,
+    };
+  } catch (err) {
+    console.warn('extractAcousticPhraseMap failed:', err);
+    return { detectedIntroSilence: userVocalStartTime, detectedBreaks: [], phrases: [] };
+  }
+}
+
+/**
  * Finds the nearest acoustic onset / vocal attack within a search window (default up to 3.5s)
- * around targetTime. Detects where vocal energy rises sharply above local background silence / valley floor.
+ * around targetTime. Walks down the leading slope to the exact valley-to-mountain onset edge.
  */
 export function findNearestAcousticOnset(
   audioBuffer: AudioBuffer,
@@ -746,88 +1011,63 @@ export function findNearestAcousticOnset(
   searchWindowSeconds = 3.5
 ): number | null {
   if (!audioBuffer) return null;
-  const sampleRate = audioBuffer.sampleRate;
-  const channelData = audioBuffer.getChannelData(0);
-  const totalDuration = audioBuffer.duration;
+  const { env, prominence, frameCount, hopSec, maxEnergy } = buildPrecisionEnvelope10ms(audioBuffer);
 
-  const minTime = Math.max(0, targetTime - 1.5);
-  const maxTime = Math.min(totalDuration, targetTime + searchWindowSeconds);
+  const minFrame = Math.max(2, Math.floor(Math.max(0, targetTime - 1.5) / hopSec));
+  const maxFrame = Math.min(frameCount - 3, Math.floor((targetTime + searchWindowSeconds) / hopSec));
+  if (maxFrame <= minFrame + 5) return null;
 
-  const startSample = Math.floor(minTime * sampleRate);
-  const endSample = Math.min(channelData.length, Math.floor(maxTime * sampleRate));
+  const targetFrame = Math.floor(targetTime / hopSec);
 
-  const hopSize = Math.floor(sampleRate * 0.01); // 10ms
-  const hopCount = Math.floor((endSample - startSample) / hopSize);
-  if (hopCount < 5) return null;
-
-  const rawEnergies: number[] = new Array(hopCount);
-  for (let h = 0; h < hopCount; h++) {
-    const s = startSample + h * hopSize;
-    let sum = 0;
-    const end = Math.min(channelData.length, s + hopSize);
-    for (let k = s; k < end; k += 2) {
-      const v = channelData[k];
-      sum += v * v;
-    }
-    rawEnergies[h] = Math.sqrt(sum / (hopSize / 2));
-  }
-
-  const energies: number[] = new Array(hopCount);
-  for (let h = 0; h < hopCount; h++) {
-    let s = 0;
-    let count = 0;
-    for (let k = -1; k <= 1; k++) {
-      const idx = h + k;
-      if (idx >= 0 && idx < hopCount) {
-        s += rawEnergies[idx];
-        count++;
+  // If targetTime is already inside an active vocal mountain, walk back to the valley floor
+  if (targetFrame >= minFrame && targetFrame <= maxFrame && prominence[targetFrame] >= 0.32) {
+    let onset = targetFrame;
+    const maxWalkBack = Math.max(minFrame, targetFrame - 95); // up to 0.95s back
+    while (onset > maxWalkBack && prominence[onset - 1] > 0.16) {
+      if (env[onset] <= env[onset - 1] && env[onset] <= env[onset + 1] && prominence[onset] < 0.28) {
+        break;
       }
+      onset--;
     }
-    energies[h] = s / count;
+    return Math.round(Math.max(0, onset - 2) * hopSec * 100) / 100;
   }
 
-  let maxEnergy = 0.005;
-  for (let h = 0; h < hopCount; h++) {
-    if (energies[h] > maxEnergy) maxEnergy = energies[h];
-  }
-
-  let valleyFloorSum = 0;
-  const valleyFrames = Math.min(25, hopCount);
-  for (let h = 0; h < valleyFrames; h++) {
-    valleyFloorSum += energies[h];
-  }
-  const valleyFloor = valleyFloorSum / valleyFrames;
-  const threshold = Math.max(0.012, valleyFloor * 1.55);
-
-  let maxScore = -1;
-  let bestHop = -1;
-  for (let h = 2; h < hopCount - 1; h++) {
-    const slope = energies[h] - energies[h - 2];
-    const curVal = energies[h];
-    if (slope > 0.006 && curVal >= threshold) {
-      const hopTime = minTime + (h * hopSize) / sampleRate;
-      const dist = Math.abs(hopTime - targetTime);
-      const proximityWeight = 1 / (1 + dist * 0.4);
-      const score = slope * proximityWeight * (curVal / maxEnergy);
-      if (score > maxScore) {
-        maxScore = score;
-        bestHop = h;
+  let bestScore = -1;
+  let bestRiseFrame = -1;
+  for (let f = minFrame; f <= maxFrame - 10; f++) {
+    const slope = prominence[f + 2] - prominence[f - 2];
+    if (slope > 0.08 && prominence[f + 2] >= 0.35 && env[f + 2] >= maxEnergy * 0.1) {
+      const distSec = Math.abs(f * hopSec - targetTime);
+      const proximity = 1 / (1 + distSec * 0.45);
+      const score = slope * proximity * prominence[f + 2];
+      if (score > bestScore) {
+        bestScore = score;
+        bestRiseFrame = f;
       }
     }
   }
 
-  if (bestHop > 0) {
-    const onsetTime = minTime + (bestHop * hopSize) / sampleRate;
-    return Math.round(onsetTime * 100) / 100;
+  if (bestRiseFrame > 0) {
+    let onset = bestRiseFrame;
+    const maxWalkBack = Math.max(minFrame, bestRiseFrame - 35);
+    while (onset > maxWalkBack && prominence[onset - 1] > 0.15) {
+      onset--;
+    }
+    return Math.round(Math.max(0, onset - 2) * hopSec * 100) / 100;
   }
 
   return null;
 }
 
 /**
- * High-precision Acoustic Waveform Phrase Aligner:
- * Scans the actual audio waveform amplitude & energy envelope directly from the decoded AudioBuffer,
- * matching how a human visually spots the start of sung phrases after quiet valleys on the waveform.
+ * High-precision Valley-to-Valley Acoustic Waveform Phrase Aligner:
+ * Locks every subtitle block's left edge (`startTime`) to the exact valley-to-mountain vocal onset
+ * and right edge (`endTime`) to the exact mountain-to-valley breath drop on the waveform.
+ *
+ * Solves:
+ * 1. Late starts where a box began on the 2nd loud word ("heavy") instead of the phrase onset ("The")
+ * 2. Early cutoffs where a box ended in the middle of a yellow/green vocal peak before the valley
+ * 3. Over-stretched 5.5s boxes that swallowed two separate vocal mountains across a breath valley
  */
 export function alignCuesWithAcousticWaveform<T extends { id: number; startTime: number; endTime: number; text?: string }>(
   audioBuffer: AudioBuffer,
@@ -836,141 +1076,181 @@ export function alignCuesWithAcousticWaveform<T extends { id: number; startTime:
 ): T[] {
   if (!audioBuffer || cues.length === 0) return cues;
 
-  const sampleRate = audioBuffer.sampleRate;
-  const channelData = audioBuffer.getChannelData(0);
-  const totalDuration = audioBuffer.duration;
-
-  const hopSize = Math.floor(sampleRate * 0.01); // 10ms
-  const frameCount = Math.floor(channelData.length / hopSize);
-  const rawEnv = new Float32Array(frameCount);
-
-  for (let f = 0; f < frameCount; f++) {
-    const start = f * hopSize;
-    let sum = 0;
-    const end = Math.min(channelData.length, start + hopSize);
-    for (let j = start; j < end; j += 2) {
-      const v = channelData[j];
-      sum += v * v;
-    }
-    rawEnv[f] = Math.sqrt(sum / (hopSize / 2));
-  }
-
-  const env = new Float32Array(frameCount);
-  for (let f = 0; f < frameCount; f++) {
-    let s = 0;
-    let count = 0;
-    for (let k = -2; k <= 2; k++) {
-      const idx = f + k;
-      if (idx >= 0 && idx < frameCount) {
-        s += rawEnv[idx];
-        count++;
-      }
-    }
-    env[f] = count > 0 ? s / count : rawEnv[f];
-  }
-
-  let maxEnergy = 0.01;
-  for (let f = 0; f < frameCount; f++) {
-    if (env[f] > maxEnergy) maxEnergy = env[f];
-  }
-  const minActiveThreshold = maxEnergy * 0.12;
+  const { env, prominence, frameCount, hopSec, totalDuration, maxEnergy } =
+    buildPrecisionEnvelope10ms(audioBuffer);
 
   const sorted = [...cues].sort((a, b) => a.id - b.id);
   let lastEnd = Math.max(0, vocalStartTime);
+  let cumulativeShift = 0;
 
   return sorted.map((cue, idx) => {
     const syllables = estimateSyllables(cue.text || '');
-    const expectedDur = Math.max(1.6, Math.min(6.8, 0.9 + syllables * 0.34));
-    const targetStart = cue.startTime;
+    // Realistic natural singing duration for a lyric line (typically 2.2s - 4.2s)
+    const naturalDur = Math.max(1.65, Math.min(4.4, 0.85 + syllables * 0.28));
 
-    const searchStartSec = Math.max(lastEnd, Math.max(0, targetStart - 2.5));
-    const searchEndSec = Math.min(totalDuration, Math.max(targetStart + 5.5, lastEnd + 8.5));
+    // Apply bounded pullback if earlier cues were un-stretched from 5.5s to their true ~3.2s mountains
+    const rawTargetStart = cue.startTime + cumulativeShift;
+    const minAllowedStart = idx === 0 ? Math.max(0, vocalStartTime) : lastEnd + 0.10;
+    const effectiveTargetStart = Math.max(minAllowedStart, rawTargetStart);
 
-    const startFrame = Math.floor(searchStartSec / 0.01);
-    const endFrame = Math.floor(searchEndSec / 0.01);
+    // Search window for onset around effectiveTargetStart
+    const searchStartSec = Math.max(minAllowedStart, effectiveTargetStart - 1.15);
+    const searchEndSec = Math.min(totalDuration - 0.5, Math.max(effectiveTargetStart + 2.4, minAllowedStart + 4.5));
 
-    let valleySum = 0;
-    let valleyCount = 0;
-    const valleySampleEnd = Math.min(endFrame, startFrame + 40);
-    for (let f = startFrame; f < valleySampleEnd; f++) {
-      valleySum += env[f];
-      valleyCount++;
-    }
-    const localFloor = valleyCount > 0 ? valleySum / valleyCount : 0.01;
-    const onsetThreshold = Math.max(minActiveThreshold, localFloor * 1.5);
+    const startFrame = Math.max(1, Math.floor(searchStartSec / hopSec));
+    const endFrame = Math.min(frameCount - 15, Math.floor(searchEndSec / hopSec));
+    const targetFrame = Math.max(startFrame, Math.min(endFrame, Math.floor(effectiveTargetStart / hopSec)));
 
-    let detectedOnsetSec: number | null = null;
-    let bestScore = -1;
+    let onsetFrame = targetFrame;
 
-    for (let f = startFrame + 2; f < endFrame - 2; f++) {
-      const slope = env[f] - env[f - 3];
-      const curEnergy = env[f];
-      const timeSec = f * 0.01;
-
-      if (slope > 0.006 && curEnergy >= onsetThreshold) {
-        const distFromTarget = Math.abs(timeSec - targetStart);
-        const proximityWeight = 1 / (1 + distFromTarget * 0.35);
-        const score = slope * proximityWeight * (curEnergy / maxEnergy);
-
-        if (score > bestScore) {
-          bestScore = score;
-          detectedOnsetSec = timeSec;
-        }
-      }
-    }
-
-    let finalStart = targetStart;
-    if (detectedOnsetSec !== null && detectedOnsetSec >= lastEnd + 0.1) {
-      finalStart = detectedOnsetSec;
-    } else if (finalStart < lastEnd) {
-      finalStart = lastEnd + 0.15;
-    }
-
-    finalStart = Math.round(finalStart * 100) / 100;
-
-    const nextCue = sorted[idx + 1];
-    const nextCueStart = nextCue ? nextCue.startTime : totalDuration;
-    const maxAllowedEndSec = nextCueStart > finalStart + 1.2
-      ? Math.min(totalDuration, nextCueStart - 0.15)
-      : Math.min(totalDuration, finalStart + 8.5);
-
-    const onsetFrame = Math.floor(finalStart / 0.01);
-    const maxFrame = Math.min(frameCount - 1, Math.floor(maxAllowedEndSec / 0.01));
-    const minPhraseFrames = Math.floor(Math.max(1.3, expectedDur * 0.55) / 0.01);
-    const vocalActiveThreshold = Math.max(minActiveThreshold * 0.85, localFloor * 1.35);
-
-    let lastActiveVocalFrame = onsetFrame + minPhraseFrames;
-    let consecutiveQuietFrames = 0;
-    const quietValleyRequirement = 22; // 220ms of low energy confirms end of phrase
-
-    for (let f = onsetFrame + Math.min(minPhraseFrames, 110); f <= maxFrame; f++) {
-      const cur = env[f];
-      if (cur >= vocalActiveThreshold) {
-        lastActiveVocalFrame = f;
-        consecutiveQuietFrames = 0;
-      } else {
-        consecutiveQuietFrames++;
-        if (consecutiveQuietFrames >= quietValleyRequirement && f >= onsetFrame + minPhraseFrames) {
+    // CASE 1: targetFrame is ALREADY inside an active vocal mountain (e.g. landed on stressed word #2)
+    // -> Walk LEFT down the slope to the valley floor where this phrase actually began!
+    if (prominence[targetFrame] >= 0.28 && env[targetFrame] >= maxEnergy * 0.10) {
+      let walk = targetFrame;
+      const minWalkFrame = Math.max(startFrame, targetFrame - 110); // Walk back up to 1.10s
+      while (walk > minWalkFrame) {
+        if (prominence[walk - 1] <= 0.16 || env[walk - 1] < maxEnergy * 0.08) {
           break;
         }
+        // Stop at a clear local minimum valley between phrases
+        if (
+          walk < targetFrame - 6 &&
+          prominence[walk] < 0.28 &&
+          env[walk] <= env[walk - 2] &&
+          env[walk] <= env[walk + 2]
+        ) {
+          break;
+        }
+        walk--;
+      }
+      onsetFrame = Math.max(startFrame, walk - 2); // 20ms pre-roll for initial consonant
+    } else {
+      // CASE 2: targetFrame is in a quiet valley -> find the nearest sustained vocal mountain onset
+      let bestRiseScore = -1;
+      let bestRiseFrame = -1;
+
+      for (let f = startFrame; f <= endFrame - 12; f++) {
+        if (prominence[f] >= 0.34 && env[f] >= maxEnergy * 0.10) {
+          // Verify sustained vocal energy over the next 220ms (not a single drum click)
+          let sustainedSum = 0;
+          for (let k = 0; k < 22 && f + k < frameCount; k++) {
+            sustainedSum += prominence[f + k];
+          }
+          const sustainedAvg = sustainedSum / 22;
+          if (sustainedAvg >= 0.32) {
+            const distSec = Math.abs(f * hopSec - effectiveTargetStart);
+            // Prefer the first clear mountain after minAllowedStart if close
+            const proximity = 1 / (1 + distSec * 0.55);
+            const score = sustainedAvg * proximity;
+            if (score > bestRiseScore) {
+              bestRiseScore = score;
+              bestRiseFrame = f;
+              // If we found a strong vocal mountain right near effectiveTargetStart, lock onto its front edge
+              if (distSec < 0.8 && sustainedAvg >= 0.42) break;
+            }
+          }
+        }
+      }
+
+      if (bestRiseFrame >= startFrame) {
+        let walk = bestRiseFrame;
+        const minWalkFrame = Math.max(startFrame, bestRiseFrame - 35);
+        while (walk > minWalkFrame && prominence[walk - 1] > 0.16 && env[walk - 1] >= maxEnergy * 0.08) {
+          walk--;
+        }
+        onsetFrame = Math.max(startFrame, walk - 2);
       }
     }
 
-    const vocalEndSec = Math.max(finalStart + 1.35, lastActiveVocalFrame * 0.01);
-    let finalEnd = vocalEndSec + 0.28;
+    const finalStart = Math.round(onsetFrame * hopSec * 100) / 100;
 
-    if (nextCueStart > finalStart + 1.2) {
-      finalEnd = Math.min(finalEnd, nextCueStart - 0.15);
+    // =========================================================================
+    // PINPOINT RIGHT EDGE (Mountain-to-Valley Offset)
+    // =========================================================================
+    const minPhraseFrames = Math.floor(Math.max(1.30, naturalDur * 0.60) / hopSec);
+    const idealPhraseFrames = Math.floor(naturalDur / hopSec);
+    const maxPhraseFrames = Math.floor(Math.max(3.6, Math.min(5.2, naturalDur * 1.45)) / hopSec);
+
+    const searchEndMinFrame = Math.min(frameCount - 1, onsetFrame + minPhraseFrames);
+    const searchEndMaxFrame = Math.min(frameCount - 1, onsetFrame + maxPhraseFrames);
+
+    // Find the clearest breath valley (local minimum of prominence) after minPhraseFrames
+    let bestValleyFrame = -1;
+    let bestValleyScore = -1;
+
+    for (let f = searchEndMinFrame; f <= searchEndMaxFrame - 6; f++) {
+      // Average prominence in a 100ms window
+      let winProm = 0;
+      for (let k = 0; k < 10 && f + k < frameCount; k++) {
+        winProm += prominence[f + k];
+      }
+      winProm /= 10;
+
+      if (winProm <= 0.34) {
+        const distFromIdeal = Math.abs(f - (onsetFrame + idealPhraseFrames)) * hopSec;
+        const idealWeight = 1 / (1 + distFromIdeal * 0.45);
+        const depthScore = (1 - winProm) * idealWeight;
+
+        // Immediately accept a deep, unmistakable breath valley (winProm <= 0.20) once past 72% of naturalDur
+        if (winProm <= 0.20 && f >= onsetFrame + Math.floor(naturalDur * 0.72 / hopSec)) {
+          bestValleyFrame = f;
+          break;
+        }
+
+        if (depthScore > bestValleyScore) {
+          bestValleyScore = depthScore;
+          bestValleyFrame = f;
+        }
+      }
     }
 
-    finalEnd = Math.min(finalEnd, totalDuration);
-    finalEnd = Math.min(finalEnd, finalStart + Math.max(3.5, expectedDur * 1.45));
+    let offsetFrame: number;
+    if (bestValleyFrame > onsetFrame) {
+      // Walk back slightly from the valley center to the exact tail of the vocal mountain (+40ms decay)
+      let tail = bestValleyFrame;
+      while (tail > searchEndMinFrame && prominence[tail] <= 0.16) {
+        tail--;
+      }
+      offsetFrame = Math.min(bestValleyFrame + 3, tail + 4);
+    } else {
+      offsetFrame = Math.min(frameCount - 1, onsetFrame + idealPhraseFrames);
+    }
+
+    // ANTI-EARLY-CUTOFF GUARD:
+    // If at offsetFrame the singer is STILL in the middle of a loud yellow/green peak (prominence >= 0.35),
+    // walk right (up to +1.1s) until the peak actually drops into the valley!
+    const hardMaxFrame = Math.min(frameCount - 1, offsetFrame + 110);
+    while (offsetFrame < hardMaxFrame && prominence[offsetFrame] >= 0.30) {
+      offsetFrame++;
+    }
+
+    let finalEnd = Math.round(offsetFrame * hopSec * 100) / 100;
     if (finalEnd <= finalStart + 1.2) {
-      finalEnd = Math.min(totalDuration, finalStart + expectedDur);
+      finalEnd = Math.min(totalDuration, Math.round((finalStart + naturalDur) * 100) / 100);
     }
 
-    finalEnd = Math.round(finalEnd * 100) / 100;
-    lastEnd = finalEnd + 0.15;
+    // Update cumulative shift smoothly if this cue was previously over-stretched (e.g. 5.5s -> 3.2s)
+    // Only pull subsequent cues back if there is vocal activity in the freed space (not an instrumental break)
+    const origEnd = cue.endTime;
+    const endDelta = finalEnd - origEnd;
+    if (endDelta < -0.8) {
+      // Check if there is an unclaimed vocal mountain right after finalEnd (within 1.2s)
+      const checkStart = Math.min(frameCount - 1, offsetFrame + 12);
+      const checkEnd = Math.min(frameCount - 1, offsetFrame + 120);
+      let activeCount = 0;
+      for (let f = checkStart; f < checkEnd; f++) {
+        if (prominence[f] >= 0.35) activeCount++;
+      }
+      if (activeCount >= 25) {
+        // There IS a vocal mountain right after finalEnd that was previously swallowed by this cue!
+        cumulativeShift = Math.max(-12.0, finalEnd + 0.25 - (sorted[idx + 1]?.startTime ?? finalEnd));
+      }
+    } else if (Math.abs(finalStart - cue.startTime) < 1.5) {
+      // Gradually decay shift when aligned
+      cumulativeShift = cumulativeShift * 0.5;
+    }
+
+    lastEnd = finalEnd;
 
     return {
       ...cue,
@@ -981,68 +1261,45 @@ export function alignCuesWithAcousticWaveform<T extends { id: number; startTime:
 }
 
 /**
- * Finds the natural end of a vocal phrase for a specific cue using acoustic envelope analysis.
+ * Finds the natural end of a vocal phrase for a specific cue using precision vocal envelope analysis.
  */
 export function findVocalPhraseEnd(
   audioBuffer: AudioBuffer,
   startTime: number,
   maxEndSec: number,
-  minDuration = 1.8
+  minDuration = 1.6
 ): number | null {
   if (!audioBuffer) return null;
-  const sampleRate = audioBuffer.sampleRate;
-  const channelData = audioBuffer.getChannelData(0);
-  const totalDuration = audioBuffer.duration;
+  const { prominence, frameCount, hopSec, totalDuration } = buildPrecisionEnvelope10ms(audioBuffer);
 
-  const hopSize = Math.floor(sampleRate * 0.01);
-  const startFrame = Math.max(0, Math.floor(startTime / 0.01));
-  const maxSearchSec = Math.min(totalDuration, Math.max(startTime + minDuration, maxEndSec));
-  const endFrame = Math.min(Math.floor(channelData.length / hopSize), Math.floor(maxSearchSec / 0.01));
+  const startFrame = Math.max(0, Math.floor(startTime / hopSec));
+  const minFrames = Math.floor(minDuration / hopSec);
+  const endFrame = Math.min(frameCount - 1, Math.floor(Math.min(totalDuration, maxEndSec) / hopSec));
 
   if (endFrame <= startFrame + 10) return null;
 
-  const frameCount = endFrame - startFrame;
-  const env = new Float32Array(frameCount);
-  let maxLocal = 0.01;
-
-  for (let i = 0; i < frameCount; i++) {
-    const s = (startFrame + i) * hopSize;
-    let sum = 0;
-    const end = Math.min(channelData.length, s + hopSize);
-    for (let j = s; j < end; j += 2) {
-      const v = channelData[j];
-      sum += v * v;
-    }
-    const rms = Math.sqrt(sum / (hopSize / 2));
-    env[i] = rms;
-    if (rms > maxLocal) maxLocal = rms;
-  }
-
-  const quietThreshold = maxLocal * 0.22;
-  const minFrames = Math.floor(minDuration / 0.01);
-  let lastActiveIdx = Math.min(frameCount - 1, minFrames);
+  let lastActiveFrame = Math.min(endFrame, startFrame + minFrames);
   let quietCount = 0;
 
-  for (let i = Math.min(minFrames, 80); i < frameCount; i++) {
-    if (env[i] >= quietThreshold) {
-      lastActiveIdx = i;
+  for (let f = Math.min(endFrame, startFrame + Math.floor(minFrames * 0.75)); f <= endFrame; f++) {
+    if (prominence[f] >= 0.25) {
+      lastActiveFrame = f;
       quietCount = 0;
     } else {
       quietCount++;
-      if (quietCount >= 25 && i >= minFrames) {
+      if (quietCount >= 14 && f >= startFrame + minFrames) {
         break;
       }
     }
   }
 
-  const detectedVocalEnd = startTime + lastActiveIdx * 0.01;
-  const withPad = detectedVocalEnd + 0.35;
-  const clamped = Math.min(maxEndSec, Math.min(totalDuration, withPad));
+  const detectedVocalEnd = (lastActiveFrame + 4) * hopSec; // +40ms vowel decay tail
+  const clamped = Math.min(maxEndSec, Math.min(totalDuration, detectedVocalEnd));
   return Math.round(clamped * 100) / 100;
 }
 
 /**
- * Snaps all subtitle cues to their nearest acoustic onset,
+ * Snaps all subtitle cues to their nearest acoustic onset & valley offset,
  * maintaining chronological ordering and avoiding overlap.
  */
 export function snapCuesToAudioOnsets<T extends { id: number; startTime: number; endTime: number; text?: string }>(

@@ -25,6 +25,7 @@ import {
   detectVocalStartLocally,
   alignLyricsToAudioAcoustically,
   alignCuesWithAcousticWaveform,
+  extractAcousticPhraseMap,
 } from './utils/audioWaveform';
 import { runLocalWhisperAlignment } from './utils/whisperAligner';
 import { DEMO_TRACKS, synthesizeDemoTrack } from './utils/audioSynthesizer';
@@ -441,6 +442,27 @@ export default function App() {
         }));
       }, 1200);
 
+      // Pre-extract precision acoustic waveform islands & breaks in the browser
+      let clientPhraseMap: {
+        detectedIntroSilence: number;
+        detectedBreaks: { start: number; end: number; duration: number }[];
+        phrases: { start: number; end: number; duration: number }[];
+      } = {
+        detectedIntroSilence: vocalStartTime || 0,
+        detectedBreaks: [],
+        phrases: [],
+      };
+
+      if (audioBlob) {
+        try {
+          clientPhraseMap = await extractAcousticPhraseMap(audioBlob, vocalStartTime || 0);
+        } catch (err) {
+          console.warn('Pre-sync acoustic map extraction warning:', err);
+        }
+      }
+
+      const initialVocalStart = vocalStartTime > 0 ? vocalStartTime : clientPhraseMap.detectedIntroSilence;
+
       // Execute Server API Sync (handles optional translation or Gemini sync if key is present)
       const response = await fetch('/api/sync', {
         method: 'POST',
@@ -455,7 +477,9 @@ export default function App() {
           audioDuration: Math.round(audioDuration),
           translatedPairs: translatedPreviewPairs || undefined,
           style: translationStyle,
-          vocalStartTime: vocalStartTime || 0,
+          vocalStartTime: initialVocalStart || 0,
+          clientDetectedBreaks: clientPhraseMap.detectedBreaks,
+          clientAcousticPhrases: clientPhraseMap.phrases,
         }),
       });
 
@@ -476,8 +500,12 @@ export default function App() {
 
       if (data.cues && Array.isArray(data.cues)) {
         let finalCues: SubtitleCue[] = [...data.cues].sort((a, b) => a.id - b.id);
-        let detectedBreaks = data.detectedBreaks || [];
-        let effectiveStart = Math.max(vocalStartTime || 0, data.detectedIntroSilence || 0);
+        let detectedBreaks = data.detectedBreaks || clientPhraseMap.detectedBreaks || [];
+        let effectiveStart = Math.max(
+          vocalStartTime || 0,
+          data.detectedIntroSilence || 0,
+          clientPhraseMap.detectedIntroSilence || 0
+        );
 
         // If server ran without external Gemini API key (cadence-alignment-engine) and we have the audio,
         // run our full local Whisper AI speech recognition & word-level forced aligner!
@@ -493,7 +521,7 @@ export default function App() {
               audioBlob,
               pairsForWhisper,
               audioDuration,
-              (targetLanguage || 'en') === 'nl' ? 'nl' : 'en',
+              (sourceLanguage || 'en') === 'nl' ? 'nl' : 'en',
               (percent, statusText) => {
                 setProgressState((prev) => ({
                   ...prev,
@@ -505,23 +533,9 @@ export default function App() {
             );
 
             if (whisperResult.cues.length > 0) {
-              // Automatic waveform snapping: tightens cue borders directly onto visible acoustic peaks & valleys
-              try {
-                const arrayBuf = await audioBlob.arrayBuffer();
-                const actx = new (window.AudioContext || (window as any).webkitAudioContext)();
-                const decodedBuf = await actx.decodeAudioData(arrayBuf);
-                await actx.close();
-                const snapped = alignCuesWithAcousticWaveform(
-                  decodedBuf,
-                  whisperResult.cues,
-                  whisperResult.detectedIntroSilence
-                );
-                finalCues = snapped.length > 0 ? snapped : whisperResult.cues;
-              } catch (_) {
-                finalCues = whisperResult.cues;
-              }
+              finalCues = whisperResult.cues;
               detectedBreaks = whisperResult.detectedBreaks;
-              effectiveStart = whisperResult.detectedIntroSilence;
+              effectiveStart = Math.max(effectiveStart, whisperResult.detectedIntroSilence);
             }
           } catch (whisperErr: any) {
             console.warn('Whisper alignment error, falling back to acoustic aligner:', whisperErr);
@@ -535,13 +549,30 @@ export default function App() {
               audioBlob,
               rawLyricsWithStructure,
               pairsForAcoustic,
-              vocalStartTime || 0
+              effectiveStart
             );
             if (acousticResult.cues.length > 0) {
               finalCues = acousticResult.cues;
               detectedBreaks = acousticResult.detectedBreaks;
-              effectiveStart = Math.max(vocalStartTime || 0, acousticResult.detectedIntroSilence || 0);
+              effectiveStart = Math.max(effectiveStart, acousticResult.detectedIntroSilence || 0);
             }
+          }
+        }
+
+        // ALWAYS perform sub-10ms Valley-to-Valley Acoustic Waveform Snapping on the final cues
+        // (whether from Gemini AI, Local Whisper, or Acoustic DP) so every block wraps its exact vocal mountain!
+        if (audioBlob && finalCues.length > 0) {
+          try {
+            const arrayBuf = await audioBlob.arrayBuffer();
+            const actx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const decodedBuf = await actx.decodeAudioData(arrayBuf);
+            await actx.close();
+            const snapped = alignCuesWithAcousticWaveform(decodedBuf, finalCues, effectiveStart);
+            if (snapped.length > 0) {
+              finalCues = snapped;
+            }
+          } catch (snapErr) {
+            console.warn('Waveform valley snapping warning:', snapErr);
           }
         }
 
