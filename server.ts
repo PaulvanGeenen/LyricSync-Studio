@@ -23,6 +23,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const CANDIDATE_MODELS = [
   'gemini-3.5-flash',
   'gemini-3.5-flash-lite',
+  'gemini-3-flash-preview',
   'gemini-flash-latest',
   'gemini-flash-lite-latest',
   'gemini-3.1-flash-lite',
@@ -295,10 +296,10 @@ function mergeTimingsWithPairs(
   }
 
   // Step 2: Handle vocal start offset
-  // Only shift the entire song if AI completely missed the intro (e.g. started > 2.5s before vocalStartTime)
+  // If user or AI intro detector specified vocal start time and first timing starts earlier, shift all timings forward uniformly
   if (vocalStartTime > 0 && validTimings.length > 0) {
     const minStart = Math.min(...validTimings.map((t) => t.startTime));
-    if (minStart < vocalStartTime - 2.5) {
+    if (minStart < vocalStartTime) {
       const shift = Math.round((vocalStartTime - minStart) * 100) / 100;
       console.log(`[Alignment] Shifting cues by +${shift.toFixed(2)}s to honor vocal start time ${vocalStartTime}s`);
       validTimings = validTimings.map((t) => ({
@@ -306,11 +307,6 @@ function mergeTimingsWithPairs(
         startTime: Math.round((t.startTime + shift) * 100) / 100,
         endTime: Math.round((t.endTime + shift) * 100) / 100,
       }));
-    } else if (validTimings[0].startTime < vocalStartTime - 0.3) {
-      validTimings[0].startTime = Math.round(vocalStartTime * 100) / 100;
-      if (validTimings[0].endTime <= validTimings[0].startTime + 1.2) {
-        validTimings[0].endTime = Math.round((validTimings[0].startTime + 2.8) * 100) / 100;
-      }
     }
   }
 
@@ -321,34 +317,29 @@ function mergeTimingsWithPairs(
 
   const resultCues: { id: number; startTime: number; endTime: number; text: string; originalText?: string }[] = [];
   let lastEnd = vocalStartTime;
-  let lastStart = Math.max(0, vocalStartTime - 1.5);
 
   for (let i = 0; i < pairs.length; i++) {
     const pair = pairs[i];
     const timing = timingMap.get(pair.id);
-    const lineLen = (pair.original || pair.translated).length;
-    const naturalDur = Math.max(2.4, Math.min(7.5, 1.6 + lineLen * 0.12));
+    const lineLen = pair.translated.length;
+    const naturalDur = Math.max(2.4, Math.min(8.5, 1.8 + lineLen * 0.14));
 
     let start: number;
     let end: number;
 
-    if (timing && timing.startTime >= lastStart + 0.85) {
-      // Honor AI startTime directly without snowballing forward drift from previous endTime!
-      // If the previous cue's endTime extended past this cue's startTime, trim the previous cue's endTime.
-      if (resultCues.length > 0 && resultCues[resultCues.length - 1].endTime > timing.startTime - 0.12) {
-        const prev = resultCues[resultCues.length - 1];
-        prev.endTime = Math.max(
-          Math.round((prev.startTime + 1.4) * 100) / 100,
-          Math.round((timing.startTime - 0.12) * 100) / 100
-        );
-        lastEnd = prev.endTime + 0.12;
-      }
-
-      start = Math.max(i === 0 ? vocalStartTime : lastStart + 1.0, timing.startTime);
-      // Add +0.35s post-vocal sustain tail ("stem ijlt nog even door") so subtitles never cut off abruptly
-      const rawAiDur = timing.endTime - timing.startTime + 0.35;
-      const cueDur = Math.max(2.1, Math.min(9.0, rawAiDur));
+    if (timing && timing.startTime >= lastEnd - 0.5) {
+      // Use AI timestamp directly without artificial clamp dragging it into instrumental breaks
+      start = Math.max(lastEnd, timing.startTime);
+      // Add +0.30s post-vocal sustain tail ("stem ijlt nog even door") so subtitles never cut off abruptly
+      const cueDur = Math.max(2.0, Math.min(9.5, timing.endTime - timing.startTime + 0.30));
       end = Math.round((start + cueDur) * 100) / 100;
+
+      // Ensure the +0.30s sustain tail never collides with or pushes the next cue's startTime
+      const nextPair = pairs[i + 1];
+      const nextTiming = nextPair ? timingMap.get(nextPair.id) : undefined;
+      if (nextTiming && nextTiming.startTime > start + 1.2 && end > nextTiming.startTime - 0.15) {
+        end = Math.round((nextTiming.startTime - 0.15) * 100) / 100;
+      }
     } else {
       // Find next upcoming AI anchor further down the song if one exists
       let nextAnchorTime: number | null = null;
@@ -364,11 +355,12 @@ function mergeTimingsWithPairs(
 
       if (nextAnchorTime !== null && stepsToNext > 0) {
         const available = Math.max(1.0, nextAnchorTime - lastEnd);
+        // If there is a massive gap (>18s) to the next anchor, reserve the tail for the instrumental break/solo!
         const reservedSoloGap = available > 18 ? available * 0.5 : 0;
         const availableForSinging = available - reservedSoloGap;
         const slot = availableForSinging / (stepsToNext + 1);
         start = Math.round((lastEnd + Math.max(0.15, slot * 0.08)) * 100) / 100;
-        const dur = Math.max(2.0, Math.min(naturalDur, slot * 0.88));
+        const dur = Math.max(1.8, Math.min(naturalDur, slot * 0.85));
         end = Math.round((start + dur) * 100) / 100;
       } else {
         // Space remaining cues smoothly after lastEnd
@@ -380,22 +372,21 @@ function mergeTimingsWithPairs(
     // Instrumental break collision check:
     // Ensure no cue starts in the middle of a detected acoustic solo/break
     for (const b of detectedBreaks) {
-      if (start >= b.start + 0.2 && start < b.end - 0.35) {
-        console.log(`[Break Guard] Moved Cue #${pair.id} from ${start.toFixed(1)}s past break to ${b.end.toFixed(1)}s`);
+      if (start >= b.start + 0.2 && start < b.end - 0.4) {
+        console.log(`[Break Guard] Moved Cue #${pair.id} from ${start.toFixed(1)}s past solo to ${b.end.toFixed(1)}s`);
         start = Math.round((b.end + 0.05) * 100) / 100;
         end = Math.round((start + naturalDur) * 100) / 100;
-      } else if (start < b.start && end > b.start + 0.3) {
-        // Cleanly end cue before the break begins
-        end = Math.round((b.start - 0.08) * 100) / 100;
+      } else if (start < b.start && end > b.start + 0.4) {
+        // Cleanly end cue before the solo begins
+        end = Math.round((b.start - 0.1) * 100) / 100;
       }
     }
 
-    if (end <= start + 1.1) {
+    if (end <= start) {
       end = Math.round((start + naturalDur) * 100) / 100;
     }
 
-    lastStart = start;
-    lastEnd = end + 0.12;
+    lastEnd = end + 0.15;
 
     resultCues.push({
       id: pair.id,
@@ -1269,11 +1260,11 @@ Geef het resultaat terug in een JSON object met 'alignedLines' array van precies
         const lyricsWithIndices = pairs.map((p) => `#${p.id}: ${p.original}`).join('\n');
 
         const breaksNotice =
-          mergedBreaks.length > 0
-            ? `ACOUSTICALLY DETECTED INSTRUMENTAL SOLOS & LONG BREAKS (>= 6s):
-The audio signal has the following long instrumental intervals where NO vocal singing is present:
-${mergedBreaks.map((b) => `- Break from ${Number(b.start).toFixed(2)}s to ${Number(b.end).toFixed(2)}s (Duration: ${Number(b.duration).toFixed(2)}s)`).join('\n')}
-CRITICAL: DO NOT place any subtitle cue inside these long instrumental breaks!`
+          processedAudio.detectedBreaks.length > 0
+            ? `ACOUSTICALLY DETECTED INSTRUMENTAL BREAKS & SOLOS:
+The audio signal has the following intervals where NO vocal singing is present (e.g. guitar solos, piano passages, bridge):
+${processedAudio.detectedBreaks.map((b) => `- Break from ${b.start.toFixed(1)}s to ${b.end.toFixed(1)}s (Duration: ${b.duration.toFixed(1)}s)`).join('\n')}
+CRITICAL: DO NOT place or stretch any subtitle cue into these intervals! Cues before the break must end before or at the start of the break. Cues after the break must start at or after the end of the break!`
             : 'Listen closely for any instrumental guitar/synth solos or pauses where no singing occurs.';
 
         const prompt = `You are an expert audio sound engineer and music lyric timing specialist.
@@ -1298,20 +1289,27 @@ CRITICAL RULES:
    - TOTAL CUE COUNT: There are EXACTLY ${pairs.length} cues.
    - You MUST output timings for ALL ${pairs.length} cues from #1 all the way to #${pairs.length}.
    - Do NOT stop early, and do NOT truncate or omit cues near the end of the song!
-2. Provide 'startTime' and 'endTime' for each cue in TOTAL SECONDS as floating point numbers with 0.05s precision (e.g. 42.55).
+2. Provide 'startTime' and 'endTime' for each cue in TOTAL SECONDS as floating point numbers (e.g. 14.25).
    CRITICAL MINUTE-TO-SECOND CONVERSION:
    - Always calculate seconds as: minutes * 60 + seconds.
    - Example: 1 minute 07 seconds is 67.0 seconds (NEVER write 107 seconds!).
    - Example: 1 minute 16 seconds is 76.0 seconds (NEVER write 116 seconds!).
    - Example: 1 minute 47 seconds is 107.0 seconds.
    - Example: 2 minutes 14 seconds is 134.0 seconds (NEVER write 214 seconds!).
-3. EXACT VOCAL ONSET, SUSTAIN & REVERB TAIL ("STEM IJLT NOG EVEN DOOR"):
-   - EXACT START ('startTime'): Place 'startTime' at the VERY FIRST audible onset/consonant of the first word of the line (as the singer's voice rises out of the breath valley, ~0.10s before the first stressed beat). Do NOT start late on the second word!
-   - COMPLETE PHRASE COVERAGE: Many sung lines have a short breath or caesura in the middle of the sentence (e.g. "The heavy steps ... of guilt and fear"). Ensure the single cue covers the ENTIRE sentence from the first word ("The") all the way through the last word ("fear")!
-   - VOCAL SUSTAIN & DECAY TAIL ('endTime'): Singers often hold the final vowel/note of a line and their voice echoes/reverberates ("ijlt nog even door"). NEVER cut off 'endTime' while the singer's voice is still sustaining or decaying! Set 'endTime' AFTER the final sung note and its vocal reverb tail have completely faded out into the valley (plus ~0.35s-0.45s comfortable reading hold, or up to ~0.15s before the next line's vocal attack).
-   - DURING A LONG INSTRUMENTAL SOLO/BREAK, NO ONE IS SINGING:
-     * DO NOT place any subtitle cues during an instrumental solo! Leave a genuine empty gap after the previous cue's vocal tail fades out until the singer resumes singing after the solo.
-   - 'endTime - startTime' typically ranges from 2.2 to 8.5 seconds depending on tempo and vocal sustain.
+3. VOCAL SUSTAIN, DURATION, AND PHRASE ENDINGS:
+   - A single sung lyric line typically lasts between 2.2 and 7.5 seconds (maximum 9.5 seconds).
+   - EXACT VOCAL START ('startTime'):
+     * Set 'startTime' at the exact moment the singer begins vocalizing the first word of that line.
+     * Do NOT start a cue early during the instrumental pause or breath gap after the previous line! If there is a 1 to 2 second musical pause between lines, leave that gap uncovered and start the next cue only when the voice actually starts singing that line.
+   - VOCAL SUSTAIN & TRAILING VOWELS ('endTime'):
+     * When a singer sings or sustains the final word of a line (e.g. vowel elongation, vibrato, rhyme tail), set 'endTime' when the singing note and vocal decay completely fade out (NOT prematurely in the middle of the last word).
+     * Keep the subtitle visible for natural reading comfort until the sung note finishes or until just before the next cue begins (leave at least a ~0.2s gap).
+     * Subtitles must NEVER cut off abruptly while the singer is still vocalizing the end of the line!
+   - DURING AN INSTRUMENTAL BREAK OR GUITAR SOLO, NO ONE IS SINGING:
+     * DO NOT place any subtitle cues during an instrumental solo! The screen must remain clean and silent.
+     * Leave a genuine empty gap between the cue that ends before the solo and the cue where the singer resumes singing after the solo.
+     * Example: If verse 2 ends at 01:25.00, and a solo plays until 01:46.50, the next cue MUST start at 01:46.50, NEVER during the solo!
+   - 'endTime - startTime' must NEVER exceed 9.5 seconds for any line.
 4. Ensure 'startTime' < 'endTime' for all cues, and consecutive cues must not regress backwards.
 5. NEVER output [Verse], [Chorus], or any bracketed annotations.
 6. Return a valid JSON array of objects with keys:
@@ -1321,7 +1319,7 @@ CRITICAL RULES:
 
         for (const modelName of candidateModels) {
           try {
-            console.log(`[API /api/sync] Invoking alignment with model ${modelName} (${pairs.length} cues, intro: ${effectiveVocalStart.toFixed(1)}s, ${mergedBreaks.length} breaks)...`);
+            console.log(`[API /api/sync] Invoking alignment with model ${modelName} (${pairs.length} cues, intro: ${effectiveVocalStart.toFixed(1)}s, ${processedAudio.detectedBreaks.length} breaks)...`);
             const audioPart = {
               inlineData: {
                 mimeType: processedAudio.mimeType,
@@ -1368,7 +1366,7 @@ CRITICAL RULES:
                   audioDuration || 0,
                   isTranslationNeeded,
                   effectiveVocalStart,
-                  mergedBreaks
+                  processedAudio.detectedBreaks
                 );
 
                 return res.json({
@@ -1378,7 +1376,7 @@ CRITICAL RULES:
                   sourceLanguage: effectiveSourceLang,
                   targetLanguage: effectiveTargetLang,
                   detectedIntroSilence: effectiveVocalStart,
-                  detectedBreaks: mergedBreaks,
+                  detectedBreaks: processedAudio.detectedBreaks,
                   cues: finalCues,
                 });
               }
