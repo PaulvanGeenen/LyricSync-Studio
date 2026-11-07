@@ -28,6 +28,8 @@ interface CueEditorProps {
   onUpdateCue: (updatedCue: SubtitleCue) => void;
   onAddCue: (afterIndex: number) => void;
   onDeleteCue: (id: number) => void;
+  canUndoDelete?: boolean;
+  onUndoDelete?: () => void;
   onSplitCue: (id: number, splitTime: number) => void;
   onMergeWithNext: (id: number) => void;
   onJumpToTime: (time: number) => void;

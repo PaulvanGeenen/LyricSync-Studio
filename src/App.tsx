@@ -75,6 +75,14 @@ export default function App() {
   const [isTimestampTransferOpen, setIsTimestampTransferOpen] = useState(false);
   const [isOpenSrtMp3ModalOpen, setIsOpenSrtMp3ModalOpen] = useState(false);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
+  const [deletedHistory, setDeletedHistory] = useState<
+    {
+      cues: SubtitleCue[];
+      lyrics: string;
+      translatedPairs: TranslatedLinePair[] | null;
+      selectedCueId: number | null;
+    }[]
+  >([]);
   const [activeSection, setActiveSection] = useState<'studio' | 'subtitle-edit' | 'editor'>('studio');
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
@@ -90,7 +98,7 @@ export default function App() {
     }, 3500);
   };
 
-  // Keyboard shortcut: Spacebar to toggle Play/Pause when not focused in an input
+  // Keyboard shortcuts: Spacebar (Play/Pause), Delete (Delete selected block + line), Ctrl+Z (Undo delete)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const activeTag = document.activeElement?.tagName?.toLowerCase();
@@ -99,11 +107,17 @@ export default function App() {
       if (e.code === 'Space' && audioUrl) {
         e.preventDefault();
         setIsPlaying((prev) => !prev);
+      } else if (e.key === 'Delete' && selectedCueId !== null && cues.length > 0) {
+        e.preventDefault();
+        handleDeleteCue(selectedCueId);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && deletedHistory.length > 0) {
+        e.preventDefault();
+        handleUndoDelete();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [audioUrl]);
+  }, [audioUrl, selectedCueId, cues, deletedHistory]);
 
   // Handle User Upload of Audio File
   const handleAudioSelected = async (file: File) => {
@@ -767,15 +781,45 @@ export default function App() {
     reader.readAsText(droppedSrt);
   };
 
-  // Cue Editing Handlers
+  // Cue Editing Handlers (kept in sync with lyrics and translatedPreviewPairs)
+  const syncLyricsAndPairsFromCues = (nextCues: SubtitleCue[]) => {
+    const reindexed = nextCues.map((c, idx) => ({
+      ...c,
+      id: idx + 1,
+    }));
+    setCues(reindexed);
+    setLyrics(reindexed.map((c) => c.text).join('\n'));
+    if (translatedPreviewPairs && translatedPreviewPairs.length > 0) {
+      setTranslatedPreviewPairs(
+        reindexed.map((c) => ({
+          id: c.id,
+          original: c.originalText || c.text,
+          translated: c.text,
+        }))
+      );
+    }
+    return reindexed;
+  };
+
   const handleUpdateCue = (updatedCue: SubtitleCue) => {
-    setCues((prev) =>
-      prev.map((c) => (c.id === updatedCue.id ? updatedCue : c))
-    );
+    const prevCue = cues.find((c) => c.id === updatedCue.id);
+    const nextCues = cues.map((c) => (c.id === updatedCue.id ? updatedCue : c));
+    setCues(nextCues);
+    if (prevCue && prevCue.text !== updatedCue.text) {
+      setLyrics(nextCues.map((c) => c.text).join('\n'));
+      if (translatedPreviewPairs && translatedPreviewPairs.length > 0) {
+        setTranslatedPreviewPairs(
+          nextCues.map((c) => ({
+            id: c.id,
+            original: c.originalText || c.text,
+            translated: c.text,
+          }))
+        );
+      }
+    }
   };
 
   const handleAddCue = (afterIndex: number, specificStart?: number) => {
-    const newId = cues.length > 0 ? Math.max(...cues.map((c) => c.id)) + 1 : 1;
     let newStart = 0;
     let newEnd = 3;
 
@@ -788,22 +832,66 @@ export default function App() {
       newEnd = Math.round((newStart + 3.0) * 100) / 100;
     }
 
+    const tempId = -1;
     const newCue: SubtitleCue = {
-      id: newId,
+      id: tempId,
       startTime: newStart,
       endTime: newEnd,
       text: 'Nieuwe ondertitelregel',
     };
 
-    const nextCues = [...cues, newCue].sort((a, b) => a.startTime - b.startTime);
-    setCues(nextCues);
-    setSelectedCueId(newId);
-    showToast(`Nieuwe cue #${newId} toegevoegd (${formatTimeDisplay(newStart)})`, 'info');
+    const sorted = [...cues, newCue].sort((a, b) => a.startTime - b.startTime);
+    const insertedIdx = sorted.findIndex((c) => c.id === tempId);
+    const reindexed = syncLyricsAndPairsFromCues(sorted);
+    const finalNewId = reindexed[insertedIdx]?.id || reindexed.length;
+    setSelectedCueId(finalNewId);
+    showToast(`Nieuw blok #${finalNewId} + tekstregel toegevoegd (${formatTimeDisplay(newStart)})`, 'info');
   };
 
   const handleDeleteCue = (id: number) => {
-    setCues((prev) => prev.filter((c) => c.id !== id));
-    showToast('Cue verwijderd', 'info');
+    const deleteIdx = cues.findIndex((c) => c.id === id);
+    if (deleteIdx === -1) return;
+    const deletedCue = cues[deleteIdx];
+
+    // Save snapshot for Undo
+    setDeletedHistory((prev) => [
+      ...prev.slice(-19),
+      {
+        cues: [...cues],
+        lyrics,
+        translatedPairs: translatedPreviewPairs ? [...translatedPreviewPairs] : null,
+        selectedCueId,
+      },
+    ]);
+
+    const remaining = cues.filter((c) => c.id !== id);
+    const reindexed = syncLyricsAndPairsFromCues(remaining);
+
+    // Select the next cue at the same position, or the last cue
+    if (reindexed.length > 0) {
+      const nextSelIdx = Math.min(deleteIdx, reindexed.length - 1);
+      setSelectedCueId(reindexed[nextSelIdx].id);
+    } else {
+      setSelectedCueId(null);
+    }
+
+    const previewText =
+      deletedCue.text.length > 34 ? `${deletedCue.text.slice(0, 34)}...` : deletedCue.text;
+    showToast(
+      `🗑 Blok #${deletedCue.id} én bijbehorende tekstregel ("${previewText}") verwijderd!`,
+      'info'
+    );
+  };
+
+  const handleUndoDelete = () => {
+    if (deletedHistory.length === 0) return;
+    const last = deletedHistory[deletedHistory.length - 1];
+    setDeletedHistory((prev) => prev.slice(0, -1));
+    setCues(last.cues);
+    setLyrics(last.lyrics);
+    setTranslatedPreviewPairs(last.translatedPairs);
+    setSelectedCueId(last.selectedCueId);
+    showToast('↩ Verwijderd blok en bijbehorende tekstregel zijn hersteld!', 'success');
   };
 
   const handleSplitCue = (id: number, splitTime: number) => {
@@ -820,14 +908,13 @@ export default function App() {
     const text1 = words.slice(0, half).join(' ') || cue.text;
     const text2 = words.slice(half).join(' ') || '...';
 
-    const newId = Math.max(...cues.map((c) => c.id), 0) + 1;
     const cue1: SubtitleCue = {
       ...cue,
       endTime: Math.round(splitTime * 100) / 100,
       text: text1,
     };
     const cue2: SubtitleCue = {
-      id: newId,
+      id: cue.id + 1,
       startTime: Math.round(splitTime * 100) / 100,
       endTime: cue.endTime,
       text: text2,
@@ -837,8 +924,8 @@ export default function App() {
     const index = cues.findIndex((c) => c.id === id);
     const nextCues = [...cues];
     nextCues.splice(index, 1, cue1, cue2);
-    setCues(nextCues);
-    showToast(`Cue #${cue.id} gesplitst op ${splitTime.toFixed(2)}s`, 'success');
+    syncLyricsAndPairsFromCues(nextCues);
+    showToast(`Blok #${cue.id} en tekstregel gesplitst op ${splitTime.toFixed(2)}s`, 'success');
   };
 
   const handleMergeWithNext = (id: number) => {
@@ -853,13 +940,16 @@ export default function App() {
       startTime: curr.startTime,
       endTime: next.endTime,
       text: `${curr.text} ${next.text}`.trim(),
-      originalText: curr.originalText && next.originalText ? `${curr.originalText} / ${next.originalText}` : curr.originalText || next.originalText,
+      originalText:
+        curr.originalText && next.originalText
+          ? `${curr.originalText} / ${next.originalText}`
+          : curr.originalText || next.originalText,
     };
 
     const nextCues = [...cues];
     nextCues.splice(index, 2, mergedCue);
-    setCues(nextCues);
-    showToast(`Cues #${curr.id} en #${next.id} samengevoegd`, 'success');
+    syncLyricsAndPairsFromCues(nextCues);
+    showToast(`Blokken #${curr.id} en #${next.id} (+ tekstregels) samengevoegd`, 'success');
   };
 
   const handleGlobalShift = (offsetSeconds: number) => {
@@ -1221,6 +1311,8 @@ export default function App() {
               onUpdateAllCues={setCues}
               onAddCue={handleAddCue}
               onDeleteCue={handleDeleteCue}
+              canUndoDelete={deletedHistory.length > 0}
+              onUndoDelete={handleUndoDelete}
               onSplitCue={handleSplitCue}
               onMergeWithNext={handleMergeWithNext}
               onSnapCueToPlayhead={handleSnapCueToPlayhead}
@@ -1247,6 +1339,8 @@ export default function App() {
               onUpdateCue={handleUpdateCue}
               onAddCue={handleAddCue}
               onDeleteCue={handleDeleteCue}
+              canUndoDelete={deletedHistory.length > 0}
+              onUndoDelete={handleUndoDelete}
               onSplitCue={handleSplitCue}
               onMergeWithNext={handleMergeWithNext}
               onJumpToTime={(t) => {

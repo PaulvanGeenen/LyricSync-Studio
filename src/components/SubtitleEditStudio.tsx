@@ -49,6 +49,8 @@ interface SubtitleEditStudioProps {
   onUpdateAllCues?: (cues: SubtitleCue[]) => void;
   onAddCue: (afterIndex: number, specificStart?: number) => void;
   onDeleteCue: (id: number) => void;
+  canUndoDelete?: boolean;
+  onUndoDelete?: () => void;
   onSplitCue: (id: number, splitTime: number) => void;
   onMergeWithNext: (id: number) => void;
   onSnapCueToPlayhead?: (cueId: number, targetTime: number) => void;
@@ -77,6 +79,8 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
   onUpdateAllCues,
   onAddCue,
   onDeleteCue,
+  canUndoDelete,
+  onUndoDelete,
   onSplitCue,
   onMergeWithNext,
   onSnapCueToPlayhead,
@@ -887,6 +891,9 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
                   <th className="py-1.5 px-3 w-28">Einde (Hide)</th>
                   <th className="py-1.5 px-3 w-20">Duur</th>
                   <th className="py-1.5 px-3">Tekst</th>
+                  <th className="py-1.5 px-2 w-10 text-center" title="Verwijder blok en bijbehorende tekstregel">
+                    Wis
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-900">
@@ -902,7 +909,7 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
                       key={cue.id}
                       onClick={() => onSelectCue(cue.id)}
                       onDoubleClick={() => handleReplayCue(cue)}
-                      className={`cursor-pointer transition-colors ${
+                      className={`cursor-pointer transition-colors group ${
                         isSelected
                           ? 'bg-blue-600/30 text-white border-l-4 border-blue-500 font-medium'
                           : isCurrent
@@ -916,8 +923,21 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
                       <td className={`py-1.5 px-3 tabular-nums ${isTooFast ? 'text-rose-400 font-bold' : 'text-slate-400'}`}>
                         {dur.toFixed(3)}s
                       </td>
-                      <td className="py-1.5 px-3 truncate max-w-[260px] font-sans text-xs">
+                      <td className="py-1.5 px-3 truncate max-w-[240px] font-sans text-xs">
                         {cue.text}
+                      </td>
+                      <td className="py-1 px-2 text-center">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDeleteCue(cue.id);
+                          }}
+                          className="p-1 text-slate-500 hover:text-rose-400 hover:bg-rose-950/60 rounded transition-colors cursor-pointer"
+                          title={`Verwijder blok #${cue.id} én bijbehorende tekstregel`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </td>
                     </tr>
                   );
@@ -1142,11 +1162,24 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
                       <button
                         type="button"
                         onClick={() => onDeleteCue(currentSelectedCue.id)}
-                        className="p-1 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded"
-                        title="Verwijder regel"
+                        className="px-2 py-1 bg-rose-950/90 hover:bg-rose-900 text-rose-200 hover:text-white border border-rose-500/40 rounded font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                        title="Verwijder dit blok én gelijktijdig de bijbehorende tekstregel (Sneltoets: Delete)"
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                        <span>Wis blok + regel</span>
                       </button>
+
+                      {canUndoDelete && onUndoDelete && (
+                        <button
+                          type="button"
+                          onClick={onUndoDelete}
+                          className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 rounded font-medium flex items-center gap-1 cursor-pointer"
+                          title="Herstel laatst verwijderd blok en tekstregel (Ctrl+Z)"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Herstel</span>
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1481,8 +1514,22 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
                     <div className="w-[2px] h-5 bg-white/80 rounded-full" />
                   </div>
 
+                  {/* Direct Delete button on the waveform block (top-right corner) */}
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteCue(cue.id);
+                    }}
+                    className="absolute top-1 right-4 z-30 w-4 h-4 rounded bg-rose-950/85 hover:bg-rose-600 text-rose-200 hover:text-white border border-rose-400/50 flex items-center justify-center text-[10px] font-bold leading-none transition-colors cursor-pointer shadow"
+                    title={`Verwijder blok #${cue.id} én bijbehorende tekstregel`}
+                  >
+                    &times;
+                  </button>
+
                   {/* Content inside the block */}
-                  <div className="p-2 pl-4 pr-4 pointer-events-none flex flex-col h-full justify-between">
+                  <div className="p-2 pl-4 pr-6 pointer-events-none flex flex-col h-full justify-between">
                     {/* Top: Subtitle Text */}
                     <div className="font-bold text-xs text-white leading-tight drop-shadow-md line-clamp-2">
                       {cue.text}
@@ -1595,7 +1642,29 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
                     <span>🎸 +15s Solo Break</span>
                   </button>
                 )}
+
+                <button
+                  type="button"
+                  onClick={() => onDeleteCue(currentSelectedCue.id)}
+                  className="px-2.5 py-1.5 bg-rose-950 hover:bg-rose-900 text-rose-200 hover:text-white border border-rose-500/40 rounded-lg font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  title="Verwijder het geselecteerde blok én gelijktijdig de bijbehorende tekstregel (Sneltoets: Delete)"
+                >
+                  <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                  <span>Verwijder blok + regel</span>
+                </button>
               </>
+            )}
+
+            {canUndoDelete && onUndoDelete && (
+              <button
+                type="button"
+                onClick={onUndoDelete}
+                className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 rounded-lg font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                title="Maak het verwijderen van het blok en de tekstregel ongedaan (Ctrl+Z)"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Herstel verwijderde</span>
+              </button>
             )}
 
             <button
