@@ -1059,244 +1059,288 @@ export function findNearestAcousticOnset(
   return null;
 }
 
+export interface CueDoubleCheckAdjustment {
+  id: number;
+  oldStart: number;
+  newStart: number;
+  oldEnd: number;
+  newEnd: number;
+  startDelta: number;
+  endDelta: number;
+}
+
+export interface CueDoubleCheckResult<T> {
+  cues: T[];
+  correctedCount: number;
+  adjustments: CueDoubleCheckAdjustment[];
+}
+
 /**
- * High-precision Transition-Valley Boundary Solver (`alignCuesWithAcousticWaveform`):
- * Preserves the macro phrase assignment of every cue while locking each cue's
- * left edge (`startTime`) to the exact valley-to-mountain vocal onset and
- * right edge (`endTime`) to the complete end of the vocal sustain/reverb decay tail
- * inside the quiet breath valley before the next cue.
+ * Post-Placement Acoustic Double Check & Self-Correction (`doubleCheckAndCorrectCues`):
+ * Inspects every placed subtitle block against the 10ms vocal-band + visual waveform envelope:
  *
- * Guarantees:
- * 1. Zero global drift or half-line splitting (slow 5.5s-7.0s lines stay intact).
- * 2. Left edge never starts late on the 2nd word: walks back to the valley floor onset.
- * 3. Right edge never cuts off early while the voice is still sustaining/echoing ("ijlt nog even door"):
- *    follows the vocal tail all the way into the quiet valley plus comfortable post-vocal hold padding.
+ * Stage A (Verify & Correct `startTime` for all cues):
+ *   - Measures each cue's core vocal energy (`coreEnv`, 68th percentile in the middle of the block).
+ *   - Check 1 (Too-Early Start in Inter-Line Pause): If the initial 250ms at `startTime` is sitting in a
+ *     quiet pause/turnaround (`initialEnv < onsetThreshold`), scans forward (up to +1.75s) to find the exact
+ *     frame where 180ms-sustained vocal energy rises above `onsetThreshold`, and advances `startTime` (-40ms pre-roll).
+ *   - Check 2 (Slightly-Late Start / Clipped First Word): If `startTime` is already inside high vocal energy
+ *     (`initialEnv >= highThreshold`), walks backward along that same vocal attack slope (at most 0.45s back,
+ *     and never closer than `prevEnd + 0.55s`) so the first consonant is never clipped.
+ *   - NEVER pulls a cue backward across an inter-line pause onto the previous cue!
+ *
+ * Stage B (Verify & Correct `endTime` for all cues using verified `startTime`s):
+ *   - Finds where the vocal phrase drops into the pause trough at the end of the line, and adds a
+ *     `+0.38s` post-vocal sustain tail ("stem ijlt nog even door") so the subtitle never cuts off abruptly,
+ *     while keeping at least a `0.22s` gap before the next cue's verified `startTime`.
+ */
+export function doubleCheckAndCorrectCues<T extends { id: number; startTime: number; endTime: number; text?: string }>(
+  audioBuffer: AudioBuffer,
+  cues: T[],
+  vocalStartTime = 0
+): CueDoubleCheckResult<T> {
+  if (!audioBuffer || cues.length === 0) {
+    return { cues, correctedCount: 0, adjustments: [] };
+  }
+
+  const { env, prominence, frameCount, hopSec, totalDuration } =
+    buildPrecisionEnvelope10ms(audioBuffer);
+
+  const sorted = [...cues].sort((a, b) => a.id - b.id).map((c) => ({ ...c }));
+  const numCues = sorted.length;
+  const adjustments: CueDoubleCheckAdjustment[] = [];
+
+  const origStarts = sorted.map((c) => c.startTime);
+  const origEnds = sorted.map((c) => c.endTime);
+
+  // Helper: average env over [fStart, fEnd] inclusive
+  const avgEnvInRange = (fStart: number, fEnd: number): number => {
+    const s = Math.max(0, Math.min(frameCount - 1, fStart));
+    const e = Math.max(s, Math.min(frameCount - 1, fEnd));
+    let sum = 0;
+    let cnt = 0;
+    for (let f = s; f <= e; f++) {
+      sum += env[f];
+      cnt++;
+    }
+    return cnt > 0 ? sum / cnt : 0;
+  };
+
+  // Helper: compute percentile of env in [fStart, fEnd]
+  const percentileEnv = (fStart: number, fEnd: number, p: number): number => {
+    const s = Math.max(0, Math.min(frameCount - 1, fStart));
+    const e = Math.max(s, Math.min(frameCount - 1, fEnd));
+    const vals: number[] = [];
+    for (let f = s; f <= e; f++) {
+      vals.push(env[f]);
+    }
+    if (vals.length === 0) return 0.1;
+    vals.sort((a, b) => a - b);
+    return vals[Math.min(vals.length - 1, Math.floor(vals.length * p))];
+  };
+
+  // =========================================================================
+  // STAGE A: Verify & Correct `startTime` of every cue independently
+  // =========================================================================
+  const coreEnvPerCue = new Float32Array(numCues);
+  const troughEnvPerCue = new Float32Array(numCues);
+
+  for (let i = 0; i < numCues; i++) {
+    const cur = sorted[i];
+    const prev = i > 0 ? sorted[i - 1] : null;
+    const dur = Math.max(1.8, cur.endTime - cur.startTime);
+
+    // 1. Measure core vocal energy in the middle of the cue (where the singer is actively singing)
+    const coreStartSec = cur.startTime + Math.min(1.25, dur * 0.25);
+    const coreEndSec = Math.max(coreStartSec + 0.8, cur.endTime - Math.min(0.75, dur * 0.18));
+    const coreStartF = Math.floor(coreStartSec / hopSec);
+    const coreEndF = Math.floor(coreEndSec / hopSec);
+    const coreEnv = percentileEnv(coreStartF, coreEndF, 0.68);
+    coreEnvPerCue[i] = coreEnv;
+
+    // 2. Find trough floor energy around the transition before this cue's core
+    const troughSearchStartSec =
+      i === 0
+        ? Math.max(0, cur.startTime - 0.8)
+        : Math.max(prev!.startTime + 1.8, Math.min(prev!.endTime - 0.3, cur.startTime - 0.5));
+    const troughSearchEndSec = Math.min(cur.endTime - 1.5, cur.startTime + 1.35);
+    const tStartF = Math.max(0, Math.floor(troughSearchStartSec / hopSec));
+    const tEndF = Math.min(frameCount - 16, Math.floor(troughSearchEndSec / hopSec));
+
+    let troughEnv = percentileEnv(tStartF, Math.max(tStartF + 5, tEndF), 0.18);
+    let troughMinF = Math.floor(cur.startTime / hopSec);
+    let minWinAvg = Infinity;
+
+    // Find the quietest 160ms (16-frame) pause window before the core vocal
+    for (let f = tStartF; f <= tEndF; f++) {
+      const wAvg = avgEnvInRange(f, f + 15);
+      if (wAvg < minWinAvg) {
+        minWinAvg = wAvg;
+        troughMinF = f + 8;
+      }
+    }
+    if (minWinAvg < Infinity) {
+      troughEnv = Math.min(troughEnv, minWinAvg);
+    }
+    troughEnvPerCue[i] = troughEnv;
+
+    const dynamicRange = Math.max(0.04, coreEnv - troughEnv);
+    // Only adjust if there is clear acoustic contrast between the pause trough and the sung phrase
+    if (coreEnv <= troughEnv * 1.25) {
+      continue;
+    }
+
+    const startF = Math.floor(cur.startTime / hopSec);
+    const initial240msEnv = avgEnvInRange(startF, startF + 24);
+    const onsetThreshold = troughEnv + 0.42 * dynamicRange;
+    const sustainThreshold = troughEnv + 0.45 * dynamicRange;
+
+    if (initial240msEnv < onsetThreshold) {
+      // CASE 1: Block starts TOO EARLY (sitting inside the quiet pause/turnaround before the voice enters)
+      // Scan forward from max(startF, troughMinF) up to +1.75s (leaving at least 2.1s duration for the cue)
+      const scanStartF = Math.max(
+        i === 0 ? Math.floor(Math.max(0, vocalStartTime - 0.3) / hopSec) : startF,
+        troughMinF
+      );
+      const maxForwardSec = Math.min(cur.endTime - 2.0, cur.startTime + 1.75);
+      const scanEndF = Math.min(frameCount - 20, Math.floor(maxForwardSec / hopSec));
+
+      let foundOnsetF = -1;
+      for (let f = scanStartF; f <= scanEndF; f++) {
+        if (env[f] >= onsetThreshold && prominence[f] >= 0.24) {
+          // Verify that this is a sustained vocal entrance (180ms = 18 frames) and not a brief guitar pluck
+          const sustained180ms = avgEnvInRange(f, f + 17);
+          if (sustained180ms >= sustainThreshold) {
+            foundOnsetF = f;
+            break;
+          }
+        }
+      }
+
+      if (foundOnsetF > startF) {
+        // Walk back up to 4 frames (40ms) down the attack slope to capture the initial consonant
+        let refinedF = foundOnsetF;
+        const slopeFloor = troughEnv + 0.18 * dynamicRange;
+        while (refinedF > startF && foundOnsetF - refinedF < 4 && env[refinedF - 1] >= slopeFloor) {
+          refinedF--;
+        }
+        const newStartSec = Math.round(refinedF * hopSec * 100) / 100;
+        if (newStartSec > cur.startTime + 0.06 && newStartSec < cur.endTime - 1.8) {
+          cur.startTime = newStartSec;
+        }
+      }
+    } else if (initial240msEnv >= troughEnv + 0.70 * dynamicRange) {
+      // CASE 2: Block starts SLIGHTLY LATE (already inside strong vocal energy at `startTime`)
+      // Walk backward along this same vocal phrase's attack slope, at most 0.42s back,
+      // and NEVER closer than `prev.endTime + 0.55s` so we never collapse inter-line pauses!
+      const minAllowedSec =
+        i === 0
+          ? Math.max(0, vocalStartTime - 0.3, cur.startTime - 0.42)
+          : Math.max(prev!.endTime + 0.55, cur.startTime - 0.42);
+      const minAllowedF = Math.max(1, Math.floor(minAllowedSec / hopSec));
+
+      if (startF > minAllowedF + 3) {
+        let walkF = startF;
+        const attackFloor = troughEnv + 0.24 * dynamicRange;
+        while (walkF > minAllowedF && env[walkF - 1] >= attackFloor && prominence[walkF - 1] >= 0.20) {
+          walkF--;
+        }
+        // Only apply if we actually reached a quieter onset edge before startF
+        if (walkF < startF - 3 && env[walkF] < initial240msEnv * 0.78) {
+          const newStartSec = Math.round(walkF * hopSec * 100) / 100;
+          if (cur.startTime - newStartSec >= 0.06) {
+            cur.startTime = newStartSec;
+          }
+        }
+      }
+    }
+  }
+
+  // =========================================================================
+  // STAGE B: Verify & Correct `endTime` of every cue (with +0.38s vocal sustain tail)
+  // =========================================================================
+  for (let i = 0; i < numCues; i++) {
+    const cur = sorted[i];
+    const next = i < numCues - 1 ? sorted[i + 1] : null;
+    const coreEnv = coreEnvPerCue[i];
+    const troughEnv = troughEnvPerCue[i];
+    const dynamicRange = Math.max(0.04, coreEnv - troughEnv);
+
+    const maxAllowedEndSec = next
+      ? Math.max(cur.startTime + 1.8, next.startTime - 0.22)
+      : Math.min(totalDuration, cur.endTime + 1.5);
+
+    // Search around cur.endTime for where the vocal sustain drops into the pause trough
+    const searchStartSec = Math.max(cur.startTime + 2.0, cur.endTime - 1.15);
+    const searchEndSec = Math.min(maxAllowedEndSec, Math.max(cur.endTime + 0.9, cur.startTime + 3.2));
+
+    const sF = Math.max(0, Math.floor(searchStartSec / hopSec));
+    const eF = Math.min(frameCount - 1, Math.floor(searchEndSec / hopSec));
+
+    if (eF > sF + 12 && coreEnv > troughEnv * 1.22) {
+      const tailActiveThreshold = troughEnv + 0.26 * dynamicRange;
+      let lastVocalF = -1;
+
+      for (let f = sF; f <= eF; f++) {
+        // Check if 60ms local window still has vocal energy
+        const localEnv = avgEnvInRange(Math.max(0, f - 3), Math.min(frameCount - 1, f + 3));
+        if (localEnv >= tailActiveThreshold && prominence[f] >= 0.18) {
+          lastVocalF = f;
+        }
+      }
+
+      if (lastVocalF > sF) {
+        // Add +0.38s post-vocal sustain tail ("stem ijlt nog even door") so the block never cuts off abruptly
+        const sustainedEndSec = Math.min(maxAllowedEndSec, (lastVocalF + 38) * hopSec);
+        const roundedEnd = Math.round(sustainedEndSec * 100) / 100;
+        if (roundedEnd >= cur.startTime + 2.0 && Math.abs(roundedEnd - cur.endTime) >= 0.08) {
+          cur.endTime = roundedEnd;
+        }
+      }
+    }
+
+    // Final safety clamp against next cue's verified startTime
+    if (next && cur.endTime > next.startTime - 0.18) {
+      cur.endTime = Math.max(
+        Math.round((cur.startTime + 1.5) * 100) / 100,
+        Math.round((next.startTime - 0.18) * 100) / 100
+      );
+    }
+  }
+
+  // Record all adjustments for the Double Check audit report
+  for (let i = 0; i < numCues; i++) {
+    const startDelta = Math.round((sorted[i].startTime - origStarts[i]) * 100) / 100;
+    const endDelta = Math.round((sorted[i].endTime - origEnds[i]) * 100) / 100;
+    if (Math.abs(startDelta) >= 0.05 || Math.abs(endDelta) >= 0.05) {
+      adjustments.push({
+        id: sorted[i].id,
+        oldStart: origStarts[i],
+        newStart: sorted[i].startTime,
+        oldEnd: origEnds[i],
+        newEnd: sorted[i].endTime,
+        startDelta,
+        endDelta,
+      });
+    }
+  }
+
+  return {
+    cues: sorted,
+    correctedCount: adjustments.length,
+    adjustments,
+  };
+}
+
+/**
+ * Wrapper around `doubleCheckAndCorrectCues` for callers expecting the corrected cues array directly.
  */
 export function alignCuesWithAcousticWaveform<T extends { id: number; startTime: number; endTime: number; text?: string }>(
   audioBuffer: AudioBuffer,
   cues: T[],
   vocalStartTime = 0
 ): T[] {
-  if (!audioBuffer || cues.length === 0) return cues;
-
-  const { env, prominence, frameCount, hopSec, totalDuration, maxEnergy } =
-    buildPrecisionEnvelope10ms(audioBuffer);
-
-  const sorted = [...cues].sort((a, b) => a.id - b.id).map((c) => ({ ...c }));
-  const numCues = sorted.length;
-
-  // Helper: find the deepest quiet valley frame in [startF, endF]
-  // Uses a 120ms (12-frame) sliding window of combined env + prominence
-  const findBestValleyInWindow = (startF: number, endF: number, preferredCenterF: number): {
-    valleyMinFrame: number;
-    valleyLeftFrame: number;
-    valleyRightFrame: number;
-  } => {
-    const sF = Math.max(2, Math.min(frameCount - 15, startF));
-    const eF = Math.max(sF + 4, Math.min(frameCount - 5, endF));
-
-    let minScore = Infinity;
-    let bestMinF = Math.max(sF, Math.min(eF, preferredCenterF));
-
-    for (let f = sF; f <= eF - 8; f++) {
-      let sumEnv = 0;
-      let sumProm = 0;
-      for (let k = 0; k < 8; k++) {
-        sumEnv += env[f + k];
-        sumProm += prominence[f + k];
-      }
-      const avgEnv = sumEnv / 8;
-      const avgProm = sumProm / 8;
-      const centerF = f + 4;
-      // Gentle distance penalty so if two valleys are equally deep, we prefer the one nearest the boundary
-      const distSec = Math.abs(centerF - preferredCenterF) * hopSec;
-      const score = (avgEnv * 0.65 + avgProm * 0.35) * (1 + distSec * 0.18);
-
-      if (score < minScore) {
-        minScore = score;
-        bestMinF = centerF;
-      }
-    }
-
-    const valleyFloorEnv = env[bestMinF];
-
-    // Find peak energy to the left (tail of previous phrase) and right (onset of next phrase)
-    let leftPeakEnv = valleyFloorEnv + 0.05;
-    const leftScanStart = Math.max(0, bestMinF - 120);
-    for (let f = leftScanStart; f < bestMinF; f++) {
-      if (env[f] > leftPeakEnv) leftPeakEnv = env[f];
-    }
-
-    let rightPeakEnv = valleyFloorEnv + 0.05;
-    const rightScanEnd = Math.min(frameCount - 1, bestMinF + 120);
-    for (let f = bestMinF + 1; f <= rightScanEnd; f++) {
-      if (env[f] > rightPeakEnv) rightPeakEnv = env[f];
-    }
-
-    // Walk left from bestMinF to find where the previous vocal sustain tail finished dropping into the valley
-    const leftThreshold = valleyFloorEnv + (leftPeakEnv - valleyFloorEnv) * 0.18;
-    let leftEdgeF = bestMinF;
-    while (leftEdgeF > sF && env[leftEdgeF - 1] <= leftThreshold) {
-      leftEdgeF--;
-    }
-
-    // Walk right from bestMinF to find where the next vocal phrase starts rising out of the valley
-    const rightThreshold = valleyFloorEnv + (rightPeakEnv - valleyFloorEnv) * 0.16;
-    let rightEdgeF = bestMinF;
-    while (rightEdgeF < eF && env[rightEdgeF + 1] <= rightThreshold) {
-      rightEdgeF++;
-    }
-
-    return {
-      valleyMinFrame: bestMinF,
-      valleyLeftFrame: leftEdgeF,
-      valleyRightFrame: rightEdgeF,
-    };
-  };
-
-  // 1. Refine Cue #1 startTime (onset after intro)
-  {
-    const first = sorted[0];
-    const minIntroF = Math.max(1, Math.floor(Math.max(0, vocalStartTime - 0.4) / hopSec));
-    const searchStartF = Math.max(minIntroF, Math.floor((first.startTime - 0.95) / hopSec));
-    const searchEndF = Math.min(
-      Math.floor((first.endTime - 1.2) / hopSec),
-      Math.floor((first.startTime + 0.85) / hopSec)
-    );
-
-    if (searchEndF > searchStartF + 10) {
-      const { valleyRightFrame } = findBestValleyInWindow(
-        searchStartF,
-        searchEndF,
-        Math.floor(first.startTime / hopSec)
-      );
-      // Step back 40ms from rise to capture initial breath/consonant
-      const snappedStart = Math.max(0, (valleyRightFrame - 4) * hopSec);
-      if (snappedStart < first.endTime - 1.2) {
-        first.startTime = Math.round(snappedStart * 100) / 100;
-      }
-    }
-  }
-
-  // 2. Refine every transition between Cue i and Cue i+1
-  for (let i = 0; i < numCues - 1; i++) {
-    const cur = sorted[i];
-    const next = sorted[i + 1];
-    const rawGap = next.startTime - cur.endTime;
-
-    if (rawGap <= 3.5) {
-      // Consecutive sung lines (e.g. within a verse/chorus):
-      // Find the exact breath valley in the transition zone between cur and next!
-      const midBoundarySec = 0.5 * (cur.endTime + next.startTime);
-      const winStartSec = Math.max(cur.startTime + 1.5, Math.min(cur.endTime, next.startTime) - 0.95);
-      const winEndSec = Math.min(next.endTime - 1.3, Math.max(cur.endTime, next.startTime) + 0.90);
-
-      const startF = Math.floor(winStartSec / hopSec);
-      const endF = Math.floor(winEndSec / hopSec);
-      const midF = Math.floor(midBoundarySec / hopSec);
-
-      if (endF > startF + 12) {
-        const { valleyMinFrame, valleyLeftFrame, valleyRightFrame } = findBestValleyInWindow(
-          startF,
-          endF,
-          midF
-        );
-
-        // Next cue starts right where the voice rises out of the valley (-40ms consonant pre-roll)
-        const newNextStart = Math.round(Math.max(winStartSec + 0.3, (valleyRightFrame - 4) * hopSec) * 100) / 100;
-
-        // Current cue holds through the entire vocal decay tail into the valley!
-        // We extend cur.endTime to valleyLeftFrame + 0.30s (capped at valleyMinFrame / newNextStart - 0.12s)
-        // so the subtitle NEVER disappears while the singer's voice is still sustaining/echoing!
-        const decayEndSec = (valleyLeftFrame + 30) * hopSec; // +300ms post-vocal sustain cushion
-        const valleyCenterSec = valleyMinFrame * hopSec;
-        const newCurEnd = Math.round(
-          Math.min(
-            newNextStart - 0.12,
-            Math.max(decayEndSec, valleyCenterSec - 0.05)
-          ) * 100
-        ) / 100;
-
-        if (newCurEnd > cur.startTime + 1.3 && newNextStart < next.endTime - 1.1 && newNextStart > newCurEnd) {
-          cur.endTime = newCurEnd;
-          next.startTime = newNextStart;
-        }
-      }
-    } else {
-      // Wider gap (> 3.5s, e.g. instrumental break / inter-verse pause):
-      // 2a. Extend cur.endTime so the vocal sustain tail finishes completely + 0.45s comfortable hold
-      const tailSearchStartF = Math.max(
-        Math.floor((cur.startTime + 1.4) / hopSec),
-        Math.floor((cur.endTime - 0.6) / hopSec)
-      );
-      const tailSearchEndF = Math.min(
-        Math.floor((next.startTime - 0.5) / hopSec),
-        Math.floor((cur.endTime + 1.6) / hopSec)
-      );
-      if (tailSearchEndF > tailSearchStartF + 10) {
-        const { valleyLeftFrame, valleyMinFrame } = findBestValleyInWindow(
-          tailSearchStartF,
-          tailSearchEndF,
-          Math.floor((cur.endTime + 0.4) / hopSec)
-        );
-        // Hold for +0.42s after vocal decay enters the break valley so it never stops abruptly
-        const sustainedEnd = Math.min(
-          next.startTime - 0.25,
-          Math.max(valleyLeftFrame * hopSec + 0.42, valleyMinFrame * hopSec)
-        );
-        if (sustainedEnd > cur.startTime + 1.4) {
-          cur.endTime = Math.round(sustainedEnd * 100) / 100;
-        }
-      }
-
-      // 2b. Snap next.startTime to the exact vocal onset after the break
-      const onsetSearchStartF = Math.max(
-        Math.floor((cur.endTime + 0.3) / hopSec),
-        Math.floor((next.startTime - 0.95) / hopSec)
-      );
-      const onsetSearchEndF = Math.min(
-        Math.floor((next.endTime - 1.2) / hopSec),
-        Math.floor((next.startTime + 0.85) / hopSec)
-      );
-      if (onsetSearchEndF > onsetSearchStartF + 10) {
-        const { valleyRightFrame } = findBestValleyInWindow(
-          onsetSearchStartF,
-          onsetSearchEndF,
-          Math.floor(next.startTime / hopSec)
-        );
-        const snappedNextStart = Math.max(cur.endTime + 0.25, (valleyRightFrame - 4) * hopSec);
-        if (snappedNextStart < next.endTime - 1.2) {
-          next.startTime = Math.round(snappedNextStart * 100) / 100;
-        }
-      }
-    }
-  }
-
-  // 3. Refine Final Cue endTime (allow full vocal sustain + 0.50s fade-out hold)
-  {
-    const last = sorted[numCues - 1];
-    const searchStartF = Math.max(
-      Math.floor((last.startTime + 1.5) / hopSec),
-      Math.floor((last.endTime - 0.5) / hopSec)
-    );
-    const searchEndF = Math.min(frameCount - 2, Math.floor(Math.min(totalDuration, last.endTime + 2.0) / hopSec));
-    if (searchEndF > searchStartF + 10) {
-      const { valleyLeftFrame, valleyMinFrame } = findBestValleyInWindow(
-        searchStartF,
-        searchEndF,
-        Math.floor((last.endTime + 0.5) / hopSec)
-      );
-      const sustainedLastEnd = Math.min(
-        totalDuration,
-        Math.max(valleyLeftFrame * hopSec + 0.50, valleyMinFrame * hopSec)
-      );
-      if (sustainedLastEnd > last.startTime + 1.5) {
-        last.endTime = Math.round(sustainedLastEnd * 100) / 100;
-      }
-    }
-  }
-
-  return sorted;
+  return doubleCheckAndCorrectCues(audioBuffer, cues, vocalStartTime).cues;
 }
 
 /**

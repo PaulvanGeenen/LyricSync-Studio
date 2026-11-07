@@ -23,6 +23,7 @@ import {
   Image as ImageIcon,
   Activity,
   Zap,
+  CheckCircle2,
 } from 'lucide-react';
 import { SubtitleCue } from '../types/subtitle';
 import { formatTimeDisplay, formatSecondsToSrt } from '../utils/timeFormat';
@@ -30,6 +31,7 @@ import {
   findNearestAcousticOnset,
   snapCuesToAudioOnsets,
   alignCuesWithAcousticWaveform,
+  doubleCheckAndCorrectCues,
   findVocalPhraseEnd,
 } from '../utils/audioWaveform';
 
@@ -144,13 +146,6 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
         audioCtx.close();
         if (!isCancelled) {
           setDecodedAudioBuffer(decoded);
-          // If cues have approximate integer cadence estimates (e.g. 25, 30, 35), immediately auto-align with waveform peaks
-          const isApproxCadence = cues.length >= 2 && cues.slice(0, 4).every((c) => Math.abs(c.startTime - Math.round(c.startTime)) < 0.01);
-          if (isApproxCadence && onUpdateAllCues) {
-            console.log('[Waveform Aligner] Detected approximate integer cadence. Auto-aligning cues with acoustic waveform peaks...');
-            const aligned = alignCuesWithAcousticWaveform(decoded, cues, cues[0]?.startTime || 0);
-            onUpdateAllCues(aligned);
-          }
         }
       } catch (err) {
         console.warn('Could not decode audio buffer for canvas waveform:', err);
@@ -602,16 +597,24 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
     }
   };
 
-  // Acoustic transient snapping for ALL cues across the entire song
+  // Double Check & Self-Correction across all cues in the song
   const handleSnapAllCuesToPeaks = () => {
     if (!decodedAudioBuffer || cues.length === 0) return;
-    const snapped = alignCuesWithAcousticWaveform(decodedAudioBuffer, cues, cues[0]?.startTime || 0);
+    const result = doubleCheckAndCorrectCues(decodedAudioBuffer, cues, cues[0]?.startTime || 0);
     if (onUpdateAllCues) {
-      onUpdateAllCues(snapped);
+      onUpdateAllCues(result.cues);
     } else {
-      snapped.forEach((c) => onUpdateCue(c));
+      result.cues.forEach((c) => onUpdateCue(c));
     }
-    showStudioToast(`⚡ Alle ${cues.length} cues haarscherp uitgelijnd op de zichtbare zangpieken in de waveform!`);
+    if (result.correctedCount > 0) {
+      showStudioToast(
+        `🔍 Dubbele controle voltooid: ${result.correctedCount} van de ${cues.length} blokken gecorrigeerd op exacte zanginzet & uitklank!`
+      );
+    } else {
+      showStudioToast(
+        `✅ Dubbele controle voltooid: alle ${cues.length} blokken staan al exact op de zang!`
+      );
+    }
   };
 
   // Extend selected cue end to the natural vocal decay valley so it never cuts off prematurely
@@ -1315,11 +1318,11 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
               <button
                 type="button"
                 onClick={handleSnapAllCuesToPeaks}
-                className="px-2 py-0.5 bg-amber-950/80 hover:bg-amber-900 text-amber-200 border border-amber-500/40 rounded font-sans font-medium flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
-                title="Lijn alle regels automatisch uit op de vocale pieken en zangdalen van de waveform"
+                className="px-2 py-0.5 bg-emerald-950/90 hover:bg-emerald-900 text-emerald-200 border border-emerald-500/40 rounded font-sans font-medium flex items-center gap-1 cursor-pointer transition-colors shadow-sm"
+                title="Voer een dubbele controle uit op alle blokken: corrigeer te vroege starts in adempauzes en verleng te korte eindes"
               >
-                <Zap className="w-3 h-3 text-amber-400" />
-                <span>Auto-Lijn Zang Uit</span>
+                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                <span>🔍 Dubbele Controle</span>
               </button>
             )}
 
@@ -1607,11 +1610,11 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
               <button
                 type="button"
                 onClick={handleSnapAllCuesToPeaks}
-                className="px-2.5 py-1.5 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-slate-950 font-bold rounded-lg flex items-center gap-1.5 shadow-md shadow-amber-900/40 transition-all active:scale-95 cursor-pointer text-xs"
-                title="Lijn alle regels haarscherp uit op de werkelijke audio-pieken van de zangstem"
+                className="px-2.5 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-slate-950 font-bold rounded-lg flex items-center gap-1.5 shadow-md shadow-emerald-900/40 transition-all active:scale-95 cursor-pointer text-xs"
+                title="Controleer alle geplaatste blokken op de audio-waveform en pas blokken die te vroeg beginnen of te vroeg stoppen automatisch aan"
               >
-                <Zap className="w-3.5 h-3.5 fill-current text-slate-950" />
-                <span>⚡ Snap Cues naar Pieken</span>
+                <CheckCircle2 className="w-3.5 h-3.5 text-slate-950" />
+                <span>🔍 Dubbele Controle (Check &amp; Corrigeer)</span>
               </button>
             )}
           </div>

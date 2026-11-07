@@ -25,6 +25,7 @@ import {
   detectVocalStartLocally,
   alignLyricsToAudioAcoustically,
   alignCuesWithAcousticWaveform,
+  doubleCheckAndCorrectCues,
   extractAcousticPhraseMap,
 } from './utils/audioWaveform';
 import { runLocalWhisperAlignment } from './utils/whisperAligner';
@@ -475,20 +476,21 @@ export default function App() {
 
       const data = await response.json();
 
-      // Final Step 4 Progress
+      // Final Step 4 Progress: Automatic Double Check & Self-Correction
       setProgressState((prev) => ({
         ...prev,
         step: 4,
-        stepLabel: `Ondertitels quantiseren (${targetLanguage === 'nl' ? '_NL' : '_EN'})...`,
-        progressPercent: 96,
+        stepLabel: `🔍 Dubbele controle: blokposities controleren en corrigeren op de zang (${targetLanguage === 'nl' ? '_NL' : '_EN'})...`,
+        progressPercent: 95,
       }));
 
-      await new Promise((res) => setTimeout(res, 400));
+      await new Promise((res) => setTimeout(res, 250));
 
       if (data.cues && Array.isArray(data.cues)) {
         let clamped: SubtitleCue[] = [...data.cues].sort((a, b) => a.id - b.id);
         let effectiveStart = Math.max(initialVocalStart || 0, data.detectedIntroSilence || 0);
         let detectedBreaks = data.detectedBreaks || [];
+        let totalDoubleCheckCorrections = Number(data.doubleCheckCorrectedCount) || 0;
 
         // Offline fallback only if server had no Gemini API key (cadence-alignment-engine)
         if (audioBlob && (!data.source || data.source === 'cadence-alignment-engine')) {
@@ -553,6 +555,29 @@ export default function App() {
           }
         }
 
+        // Pass 2B: Acoustic Waveform Double Check & Self-Correction
+        // Verifies each placed block against the 300Hz-3400Hz vocal energy envelope:
+        // - Shifts premature block starts forward out of the inter-line pause onto the true vocal attack
+        // - Extends block ends that cut off while the singer's voice is still sustaining (+0.38s tail)
+        if (audioBlob && clamped.length > 0) {
+          try {
+            const arrayBuf = await audioBlob.arrayBuffer();
+            const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const decodedBuf = await audioCtx.decodeAudioData(arrayBuf);
+            await audioCtx.close().catch(() => {});
+
+            const acousticCheck = doubleCheckAndCorrectCues(
+              decodedBuf,
+              clamped,
+              clamped[0]?.startTime || effectiveStart
+            );
+            clamped = acousticCheck.cues;
+            totalDoubleCheckCorrections = Math.max(totalDoubleCheckCorrections, acousticCheck.correctedCount);
+          } catch (checkErr) {
+            console.warn('Acoustic double-check warning:', checkErr);
+          }
+        }
+
         let lastEnd = effectiveStart;
         for (let i = 0; i < clamped.length; i++) {
           const cue = clamped[i];
@@ -578,8 +603,12 @@ export default function App() {
           detectedBreaks && detectedBreaks.length > 0
             ? ` (${detectedBreaks.length} instrumentale breaks behouden)`
             : '';
+        const doubleCheckNotice =
+          totalDoubleCheckCorrections > 0
+            ? ` — 🔍 Dubbele controle: ${totalDoubleCheckCorrections} blokken gecorrigeerd op exacte zanginzet & uitklank`
+            : ` — 🔍 Dubbele controle: alle ${clamped.length} blokken geverifieerd`;
         showToast(
-          `Succesvol ${clamped.length} ${data.translated ? 'vertaalde en ' : ''}gesynchroniseerde regels gegenereerd${breaksNotice}!`,
+          `Succesvol ${clamped.length} ${data.translated ? 'vertaalde en ' : ''}gesynchroniseerde regels gegenereerd${breaksNotice}${doubleCheckNotice}!`,
           'success'
         );
       }

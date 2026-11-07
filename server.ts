@@ -1159,6 +1159,173 @@ Geef het resultaat terug in een JSON object met 'alignedLines' array van precies
     }
   });
 
+  // Pass-2 AI Double Check & Self-Correction:
+  // Audits Pass-1 timings against the audio to fix blocks that started too early in the inter-line pause
+  // or cut off before the vocal sustain finished, bounded relative to Pass-1 to prevent cumulative drift.
+  async function doubleCheckTimingsWithAi(
+    audioPart: { inlineData: { mimeType: string; data: string } },
+    pairs: { id: number; original: string; translated: string }[],
+    pass1Timings: any[],
+    effectiveVocalStart: number,
+    audioDuration: number
+  ): Promise<{ timings: any[]; correctedCount: number }> {
+    const candidateOverview = pairs
+      .map((p, idx) => {
+        const t = pass1Timings.find((item: any) => Number(item.id) === p.id) || pass1Timings[idx];
+        const st = t ? Number(t.startTime).toFixed(2) : '0.00';
+        const et = t ? Number(t.endTime).toFixed(2) : '0.00';
+        const prev = idx > 0 ? (pass1Timings.find((item: any) => Number(item.id) === pairs[idx - 1].id) || pass1Timings[idx - 1]) : null;
+        const gapFromPrev = prev && t ? (Number(t.startTime) - Number(prev.endTime)).toFixed(2) : 'N/A';
+        return `#${p.id} [${st}s -> ${et}s | gapAfterPrev: ${gapFromPrev}s]: "${p.original}"`;
+      })
+      .join('\n');
+
+    const doubleCheckPrompt = `You are a senior audio synchronization QA engineer performing a DOUBLE CHECK (Pass 2) on subtitle blocks that were placed on a song.
+
+Below are the Pass-1 candidate subtitle blocks (with their current [startTime -> endTime] and the gap after the previous block):
+${candidateOverview}
+
+${audioDuration ? `Total song duration: ${audioDuration} seconds.` : ''}
+${effectiveVocalStart > 0 ? `Vocal intro ends and Cue #1 singing begins around ${effectiveVocalStart.toFixed(2)}s.` : ''}
+
+KNOWN PASS-1 FLAW YOU MUST CHECK AND FIX:
+In Pass 1, Cue #1 usually starts at the right time, and each cue's 'endTime' is usually close to when the singer finishes the line.
+HOWEVER, on Cues #2 through #${pairs.length}, Pass 1 frequently places 'startTime' 0.6s to 1.4s TOO EARLY (during the 0.8s–1.8s instrumental guitar/piano/drum turnaround or breath pause right after the previous line ended, often rounding to .00 or .50)!
+
+YOUR DOUBLE-CHECK MISSION:
+1. Listen carefully to the audio at every single cue from #1 to #${pairs.length}.
+2. For each cue, check: Does the singer's voice ACTUALLY start singing the first word at 'startTime', or is there still 0.5s–1.5s of instrumental turnaround / breathing before the voice enters?
+   - If 'startTime' is too early (in the pause before the singing starts), MOVE 'startTime' FORWARD (later, e.g. from 31.00s to 31.96s, or from 37.50s to 38.17s) to the exact decimal second when the first sung consonant/vowel of that line is heard!
+   - Between two consecutive sung lines, a natural pause of 0.8s to 1.6s is completely normal when the singer takes a breath.
+3. Also check 'endTime':
+   - Make sure 'endTime' does NOT cut off while the singer's voice is still sustaining/trailing at the end of the line. Keep 'endTime' right where the vocal sustain finishes.
+4. Output ALL ${pairs.length} cues (#1 to #${pairs.length}) in JSON format with 'id', 'startTime', and 'endTime'.`;
+
+    // Brief breather before Pass-2 request to avoid back-to-back burst 503s on the primary model
+    await new Promise((r) => setTimeout(r, 1200));
+
+    for (const modelName of CANDIDATE_MODELS) {
+      try {
+        console.log(`[API /api/sync] 🔍 Pass-2 Double Check with ${modelName}...`);
+        const checkRes = await generateWithRetry(
+          {
+            model: modelName,
+            contents: {
+              parts: [audioPart, { text: doubleCheckPrompt }],
+            },
+            config: {
+              temperature: 0.05,
+              maxOutputTokens: 8192,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.ARRAY,
+                description: 'Double-checked and corrected subtitle cue timestamps',
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.INTEGER },
+                    startTime: { type: Type.NUMBER },
+                    endTime: { type: Type.NUMBER },
+                  },
+                  required: ['id', 'startTime', 'endTime'],
+                },
+              },
+            },
+          },
+          2,
+          55000
+        );
+
+        const rawCheck = checkRes.text?.trim() || '';
+        if (!rawCheck) continue;
+        const checkedTimings = JSON.parse(rawCheck);
+        if (!Array.isArray(checkedTimings) || checkedTimings.length === 0) continue;
+
+        let correctedCount = 0;
+        const mergedTimings: any[] = [];
+
+        for (let i = 0; i < pairs.length; i++) {
+          const pair = pairs[i];
+          const p1 = pass1Timings.find((t: any) => Number(t.id) === pair.id) || pass1Timings[i];
+          const p2 = checkedTimings.find((t: any) => Number(t.id) === pair.id) || checkedTimings[i];
+
+          if (!p1) {
+            if (p2) mergedTimings.push(p2);
+            continue;
+          }
+          if (!p2 || typeof p2.startTime !== 'number' || typeof p2.endTime !== 'number') {
+            mergedTimings.push(p1);
+            continue;
+          }
+
+          const p1Start = Number(p1.startTime);
+          const p1End = Number(p1.endTime);
+          const p2Start = Number(p2.startTime);
+          const p2End = Number(p2.endTime);
+
+          let refinedStart = p1Start;
+          let refinedEnd = p1End;
+
+          const startDelta = p2Start - p1Start;
+          const endDelta = p2End - p1End;
+
+          if (i === 0) {
+            // Cue #1: allow minor fine-tuning within [-0.50s, +0.80s]
+            if (Math.abs(startDelta) <= 0.85 && p2Start >= Math.max(0, effectiveVocalStart - 0.5)) {
+              refinedStart = p2Start;
+            }
+          } else {
+            const prevMerged = mergedTimings[i - 1];
+            const prevEnd = prevMerged ? Number(prevMerged.endTime) : 0;
+            if (startDelta > 0.08) {
+              // Pass 2 detected that Pass 1 started too early in the turnaround pause!
+              // Clamp forward shift to at most +1.45s and keep at least 2.0s cue duration.
+              const maxForward = Math.min(1.45, Math.max(0, p1End - p1Start - 2.0));
+              refinedStart = p1Start + Math.min(startDelta, maxForward);
+            } else if (startDelta < -0.08) {
+              // Pass 2 detected a slightly earlier onset: allow up to -0.55s, respecting a >= 0.65s pause after prevEnd
+              const earliestAllowed = Math.max(p1Start - 0.55, prevEnd + 0.65);
+              if (earliestAllowed < p1Start) {
+                refinedStart = Math.max(earliestAllowed, p2Start);
+              }
+            }
+          }
+
+          // Refine endTime within [-0.35s, +0.75s] of Pass 1 so vocal sustain tails aren't cut off
+          if (endDelta >= -0.35 && endDelta <= 0.75) {
+            refinedEnd = p2End;
+          } else if (endDelta > 0.75) {
+            refinedEnd = p1End + 0.55;
+          }
+
+          if (refinedEnd <= refinedStart + 1.8) {
+            refinedEnd = Math.max(p1End, refinedStart + 2.2);
+          }
+
+          refinedStart = Math.round(refinedStart * 100) / 100;
+          refinedEnd = Math.round(refinedEnd * 100) / 100;
+
+          if (Math.abs(refinedStart - p1Start) >= 0.12 || Math.abs(refinedEnd - p1End) >= 0.12) {
+            correctedCount++;
+          }
+
+          mergedTimings.push({
+            id: pair.id,
+            startTime: refinedStart,
+            endTime: refinedEnd,
+          });
+        }
+
+        console.log(`[API /api/sync] ✅ Pass-2 Double Check completed (${modelName}): ${correctedCount}/${pairs.length} blocks refined.`);
+        return { timings: mergedTimings, correctedCount };
+      } catch (err: any) {
+        console.warn(`[API /api/sync] Pass-2 Double Check warning with ${modelName}:`, err?.message?.substring(0, 120));
+      }
+    }
+
+    return { timings: pass1Timings, correctedCount: 0 };
+  }
+
   // Lyric sync alignment endpoint
   app.post('/api/sync', async (req, res) => {
     try {
@@ -1297,13 +1464,15 @@ CRITICAL RULES:
    - Example: 1 minute 47 seconds is 107.0 seconds.
    - Example: 2 minutes 14 seconds is 134.0 seconds (NEVER write 214 seconds!).
 3. VOCAL SUSTAIN, DURATION, AND PHRASE ENDINGS:
-   - A single sung lyric line typically lasts between 2.2 and 7.5 seconds (maximum 9.5 seconds).
-   - EXACT VOCAL START ('startTime'):
-     * Set 'startTime' at the exact moment the singer begins vocalizing the first word of that line.
-     * Do NOT start a cue early during the instrumental pause or breath gap after the previous line! If there is a 1 to 2 second musical pause between lines, leave that gap uncovered and start the next cue only when the voice actually starts singing that line.
+   - A single sung lyric line typically lasts between 2.2 and 6.5 seconds (maximum 9.0 seconds).
+   - EXACT VOCAL START ('startTime') — DO NOT START EARLY IN THE PAUSE:
+     * Set 'startTime' at the exact decimal second (e.g. 26.00, 31.96, 38.17, 44.65) when the singer's voice actually begins singing the first word of that line.
+     * CRITICAL: NEVER tile or pack cues back-to-back with 0.2s–0.5s gaps if the singer pauses between lines!
+     * In almost all songs, after finishing a line ('endTime'), the singer pauses for 0.8s to 1.8s (while guitar/piano/drums play a breath or turnaround) before singing the first word of the next line ('startTime').
+     * You MUST leave that 0.8s–1.8s musical pause UNCOVERED between the previous cue's 'endTime' and the next cue's 'startTime'!
+     * Do NOT round timestamps to .00 or .50 — output the true decimal second (e.g. 31.95, 38.20, 44.65) when the human voice enters!
    - VOCAL SUSTAIN & TRAILING VOWELS ('endTime'):
-     * When a singer sings or sustains the final word of a line (e.g. vowel elongation, vibrato, rhyme tail), set 'endTime' when the singing note and vocal decay completely fade out (NOT prematurely in the middle of the last word).
-     * Keep the subtitle visible for natural reading comfort until the sung note finishes or until just before the next cue begins (leave at least a ~0.2s gap).
+     * When a singer sings or sustains the final word of a line (e.g. vowel elongation, vibrato, rhyme tail), set 'endTime' when the singing note and vocal decay completely fade out (NOT prematurely in the middle of the last word, and NOT stretched across the silent breath pause into the next line).
      * Subtitles must NEVER cut off abruptly while the singer is still vocalizing the end of the line!
    - DURING AN INSTRUMENTAL BREAK OR GUITAR SOLO, NO ONE IS SINGING:
      * DO NOT place any subtitle cues during an instrumental solo! The screen must remain clean and silent.
@@ -1359,10 +1528,19 @@ CRITICAL RULES:
             if (rawText) {
               const parsedTimings = JSON.parse(rawText);
               if (Array.isArray(parsedTimings) && parsedTimings.length > 0) {
-                // Merge timings with pairs safely respecting acoustic breaks and intro offset
-                const finalCues = mergeTimingsWithPairs(
+                // Pass 2: Automatic AI Double Check & Self-Correction on the placed blocks
+                const doubleCheckResult = await doubleCheckTimingsWithAi(
+                  audioPart,
                   pairs,
                   parsedTimings,
+                  effectiveVocalStart,
+                  audioDuration || 0
+                );
+
+                // Merge verified timings with pairs safely respecting acoustic breaks and intro offset
+                const finalCues = mergeTimingsWithPairs(
+                  pairs,
+                  doubleCheckResult.timings,
                   audioDuration || 0,
                   isTranslationNeeded,
                   effectiveVocalStart,
@@ -1377,6 +1555,7 @@ CRITICAL RULES:
                   targetLanguage: effectiveTargetLang,
                   detectedIntroSilence: effectiveVocalStart,
                   detectedBreaks: processedAudio.detectedBreaks,
+                  doubleCheckCorrectedCount: doubleCheckResult.correctedCount,
                   cues: finalCues,
                 });
               }
