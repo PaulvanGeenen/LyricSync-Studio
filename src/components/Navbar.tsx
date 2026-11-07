@@ -1,5 +1,5 @@
 import React from 'react';
-import { Music2, Download, Sparkles, RotateCcw, Video, Clock } from 'lucide-react';
+import { Music2, Download, Sparkles, RotateCcw, Video, Clock, FolderOpen } from 'lucide-react';
 
 interface NavbarProps {
   onExportClick: () => void;
@@ -11,6 +11,7 @@ interface NavbarProps {
   hasActiveProject: boolean;
   onOpenMp4Converter: () => void;
   onOpenTimestampTransfer: () => void;
+  onOpenSrtMp3?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -23,6 +24,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   hasActiveProject,
   onOpenMp4Converter,
   onOpenTimestampTransfer,
+  onOpenSrtMp3,
 }) => {
   return (
     <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800">
@@ -90,6 +92,18 @@ export const Navbar: React.FC<NavbarProps> = ({
             >
               <RotateCcw className="w-3.5 h-3.5 text-amber-400" />
               <span className="hidden sm:inline">Nieuw lied</span>
+            </button>
+          )}
+
+          {onOpenSrtMp3 && (
+            <button
+              type="button"
+              onClick={onOpenSrtMp3}
+              className="px-3.5 py-2 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-all text-amber-200 hover:text-white bg-amber-950/70 hover:bg-amber-900/80 border border-amber-500/40 shadow-sm active:scale-95 whitespace-nowrap cursor-pointer"
+              title="Open een bestaand .SRT ondertitelbestand samen met de bijbehorende .MP3 in de Subtitle Edit Studio"
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+              <span>Open .SRT + .MP3</span>
             </button>
           )}
 

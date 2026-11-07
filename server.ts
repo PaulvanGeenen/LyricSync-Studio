@@ -1749,6 +1749,66 @@ CRITICAL RULES:
     }
   });
 
+  // Local @music Library Browser endpoints (for opening existing .SRT + .MP3 directly from disk)
+  const LOCAL_MUSIC_ROOT = 'C:\\@Source\\Paul van Geenen.nl\\public\\@music';
+
+  app.get('/api/music-library', (_req, res) => {
+    try {
+      if (!fs.existsSync(LOCAL_MUSIC_ROOT)) {
+        return res.json({ available: false, rootPath: LOCAL_MUSIC_ROOT, items: [] });
+      }
+      const entries = fs.readdirSync(LOCAL_MUSIC_ROOT, { withFileTypes: true });
+      const items: {
+        folder: string;
+        audioFiles: string[];
+        srtFiles: string[];
+        txtFiles: string[];
+      }[] = [];
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const folderPath = path.join(LOCAL_MUSIC_ROOT, entry.name);
+        try {
+          const files = fs.readdirSync(folderPath);
+          const audioFiles = files.filter((f) => /\.(mp3|wav|m4a|flac|ogg|aac)$/i.test(f));
+          const srtFiles = files.filter((f) => /\.(srt|vtt)$/i.test(f));
+          const txtFiles = files.filter((f) => /\.txt$/i.test(f));
+          if (audioFiles.length > 0 || srtFiles.length > 0) {
+            items.push({
+              folder: entry.name,
+              audioFiles,
+              srtFiles,
+              txtFiles,
+            });
+          }
+        } catch (_) {}
+      }
+
+      items.sort((a, b) => a.folder.localeCompare(b.folder, undefined, { numeric: true }));
+      return res.json({ available: true, rootPath: LOCAL_MUSIC_ROOT, items });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Kon @music map niet lezen' });
+    }
+  });
+
+  app.get('/api/music-library/file', (req, res) => {
+    try {
+      const folder = String(req.query.folder || '');
+      const file = String(req.query.file || '');
+      if (!folder || !file) {
+        return res.status(400).json({ error: 'Geef zowel folder als file op.' });
+      }
+      const resolvedRoot = path.resolve(LOCAL_MUSIC_ROOT);
+      const targetPath = path.resolve(LOCAL_MUSIC_ROOT, folder, file);
+      if (!targetPath.startsWith(resolvedRoot + path.sep) || !fs.existsSync(targetPath)) {
+        return res.status(404).json({ error: 'Bestand niet gevonden.' });
+      }
+      return res.sendFile(targetPath);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || 'Fout bij openen bestand' });
+    }
+  });
+
   // Vite middleware or static dist handling
   if (!isProduction) {
     const vite = await createViteServer({

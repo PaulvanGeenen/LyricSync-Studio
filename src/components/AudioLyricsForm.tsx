@@ -19,6 +19,7 @@ import {
   Video,
   Clock,
   AlertCircle,
+  FolderOpen,
 } from 'lucide-react';
 import { SupportedLanguage, TranslatedLinePair, TranslationStyle, RephraseOption } from '../types/subtitle';
 import { formatTimeDisplay } from '../utils/timeFormat';
@@ -49,6 +50,8 @@ interface AudioLyricsFormProps {
   onLoadDemoTrack: (lang: SupportedLanguage) => void;
   onOpenMp4Converter?: () => void;
   onOpenTimestampTransfer?: () => void;
+  onOpenSrtMp3?: () => void;
+  onDirectSrtMp3Drop?: (audioFile: File | null, srtFile: File) => void;
   vocalStartTime?: number;
   onVocalStartTimeChange?: (seconds: number) => void;
   currentTime?: number;
@@ -80,6 +83,8 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
   onLoadDemoTrack,
   onOpenMp4Converter,
   onOpenTimestampTransfer,
+  onOpenSrtMp3,
+  onDirectSrtMp3Drop,
   vocalStartTime = 0,
   onVocalStartTimeChange,
   currentTime,
@@ -170,20 +175,33 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
     setIsDragging(false);
   };
 
+  const handleDroppedOrSelectedFiles = (fileList: FileList) => {
+    const files = Array.from(fileList);
+    const foundAudio = files.find(
+      (f) => f.type.startsWith('audio/') || /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(f.name)
+    );
+    const foundSrt = files.find((f) => /\.(srt|vtt)$/i.test(f.name));
+
+    if (foundSrt && onDirectSrtMp3Drop) {
+      onDirectSrtMp3Drop(foundAudio || null, foundSrt);
+      return;
+    }
+    if (foundAudio) {
+      onAudioSelected(foundAudio);
+    }
+  };
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      const file = e.dataTransfer.files[0];
-      if (file.type.startsWith('audio/') || /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(file.name)) {
-        onAudioSelected(file);
-      }
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleDroppedOrSelectedFiles(e.dataTransfer.files);
     }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      onAudioSelected(e.target.files[0]);
+    if (e.target.files && e.target.files.length > 0) {
+      handleDroppedOrSelectedFiles(e.target.files);
     }
   };
 
@@ -273,9 +291,20 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
           </p>
         </div>
 
-        {/* Demo Fast Track Loaders */}
-        <div className="flex items-center gap-2 self-start sm:self-auto">
-          <span className="text-xs text-slate-400">Voorbeeldnummers:</span>
+        {/* Quick Action & Demo Fast Track Loaders */}
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+          {onOpenSrtMp3 && (
+            <button
+              type="button"
+              onClick={onOpenSrtMp3}
+              className="px-3 py-1.5 text-xs font-bold bg-amber-950/80 hover:bg-amber-900 text-amber-200 border border-amber-500/40 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm cursor-pointer"
+              title="Open een bestaand .SRT bestand samen met de bijbehorende .MP3 direct in de Subtitle Edit Studio"
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+              <span>Open bestaande .SRT + .MP3</span>
+            </button>
+          )}
+          <span className="text-xs text-slate-400 ml-1">Voorbeeldnummers:</span>
           <button
             type="button"
             onClick={() => onLoadDemoTrack('nl')}
@@ -317,7 +346,8 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
             <input
               ref={fileInputRef}
               type="file"
-              accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac"
+              multiple
+              accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac,.srt,.vtt"
               className="hidden"
               onChange={handleFileChange}
             />
@@ -338,10 +368,10 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
                   <Upload className="w-6 h-6" />
                 </div>
                 <p className="text-sm font-medium text-slate-200">
-                  Klik om te bladeren of sleep een audiobestand hierheen
+                  Klik om te bladeren of sleep een audiobestand (of .MP3 + .SRT samen) hierheen
                 </p>
                 <p className="text-xs text-slate-400 mt-1">
-                  Ondersteunt MP3, WAV, OGG, M4A, FLAC, AAC
+                  Ondersteunt MP3, WAV, OGG, M4A, FLAC, AAC &bull; Of selecteer direct een .MP3 + .SRT tegelijk!
                 </p>
               </div>
             ) : (
@@ -378,6 +408,23 @@ export const AudioLyricsForm: React.FC<AudioLyricsFormProps> = ({
                     <X className="w-4 h-4" />
                   </button>
                 </div>
+              </div>
+            )}
+
+            {onOpenSrtMp3 && (
+              <div className="flex items-center justify-between pt-1 text-xs">
+                <span className="text-slate-400">
+                  Heb je al een .SRT bestand bij een .MP3? Open ze samen in de Studio:
+                </span>
+                <button
+                  type="button"
+                  onClick={onOpenSrtMp3}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-950/70 hover:bg-amber-900/90 text-amber-200 border border-amber-500/40 rounded-lg font-semibold transition-all shadow-sm active:scale-95 cursor-pointer"
+                  title="Open een bestaand .SRT ondertitelbestand samen met de bijbehorende .MP3 in de Subtitle Edit Studio"
+                >
+                  <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Open .SRT + .MP3</span>
+                </button>
               </div>
             )}
 

@@ -13,6 +13,8 @@ import { SyncProgressModal } from './components/SyncProgressModal';
 import { ExportModal } from './components/ExportModal';
 import { Mp3ToMp4Modal } from './components/Mp3ToMp4Modal';
 import { TimestampTransferModal } from './components/TimestampTransferModal';
+import { OpenSrtMp3Modal } from './components/OpenSrtMp3Modal';
+import { parseSrtFile, detectSrtLanguage } from './utils/srtParser';
 import {
   SubtitleCue,
   SupportedLanguage,
@@ -71,6 +73,7 @@ export default function App() {
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [isMp4ModalOpen, setIsMp4ModalOpen] = useState(false);
   const [isTimestampTransferOpen, setIsTimestampTransferOpen] = useState(false);
+  const [isOpenSrtMp3ModalOpen, setIsOpenSrtMp3ModalOpen] = useState(false);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
   const [activeSection, setActiveSection] = useState<'studio' | 'subtitle-edit' | 'editor'>('studio');
   const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
@@ -646,6 +649,124 @@ export default function App() {
     }, 300);
   };
 
+  // Load existing .SRT together with its corresponding .MP3 directly into the Subtitle Edit Studio
+  const handleLoadSrtAndMp3 = async ({
+    audioFile: incomingAudio,
+    cues: incomingCues,
+    srtFileName,
+    language,
+    runDoubleCheck,
+  }: {
+    audioFile: File | null;
+    cues: SubtitleCue[];
+    srtFileName: string;
+    language: SupportedLanguage;
+    runDoubleCheck: boolean;
+  }) => {
+    const targetAudio = incomingAudio || audioFile;
+    if (incomingAudio && incomingAudio !== audioFile) {
+      if (audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+      }
+      const url = URL.createObjectURL(incomingAudio);
+      setAudioFile(incomingAudio);
+      setAudioBlob(incomingAudio);
+      setAudioUrl(url);
+      setAudioName(incomingAudio.name);
+
+      const tempAudio = new Audio(url);
+      tempAudio.addEventListener('loadedmetadata', async () => {
+        const dur = tempAudio.duration || 30;
+        setAudioDuration(dur);
+        const peaks = await extractWaveformPeaks(incomingAudio);
+        setWaveformPeaks(peaks);
+      });
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result as string;
+        if (result && result.includes(',')) {
+          setAudioBase64(result.split(',')[1]);
+        }
+      };
+      reader.readAsDataURL(incomingAudio);
+    }
+
+    let finalCues = [...incomingCues].sort((a, b) => a.startTime - b.startTime).map((c, idx) => ({
+      ...c,
+      id: idx + 1,
+    }));
+    let correctedCount = 0;
+
+    if (runDoubleCheck && targetAudio && finalCues.length > 0) {
+      try {
+        const arrayBuf = await targetAudio.arrayBuffer();
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const decodedBuf = await audioCtx.decodeAudioData(arrayBuf);
+        await audioCtx.close().catch(() => {});
+        const checkResult = doubleCheckAndCorrectCues(
+          decodedBuf,
+          finalCues,
+          finalCues[0]?.startTime || 0
+        );
+        finalCues = checkResult.cues;
+        correctedCount = checkResult.correctedCount;
+      } catch (err) {
+        console.warn('Could not run double-check on loaded SRT:', err);
+      }
+    }
+
+    const firstStart = finalCues[0]?.startTime || 0;
+    setVocalStartTime(Math.round(firstStart * 10) / 10);
+    setLyrics(finalCues.map((c) => c.text).join('\n'));
+    setSourceLanguage(language);
+    setTargetLanguage(language);
+    setCues(finalCues);
+    setSelectedCueId(finalCues[0]?.id || null);
+    setActiveSection('subtitle-edit');
+
+    const checkSuffix = runDoubleCheck
+      ? ` (🔍 Dubbele controle: ${correctedCount} blokken bijgesteld)`
+      : '';
+    showToast(
+      `📂 "${srtFileName}" (${finalCues.length} blokken) + "${targetAudio?.name || audioName}" geopend in Subtitle Edit Studio${checkSuffix}!`,
+      'success'
+    );
+
+    setTimeout(() => {
+      subtitleEditSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, 300);
+  };
+
+  // Handle direct drag & drop of .SRT (+ optional .MP3) onto the main upload box
+  const handleDirectSrtMp3Drop = (droppedAudio: File | null, droppedSrt: File) => {
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const content = ev.target?.result as string;
+      if (!content) return;
+      const parsed = parseSrtFile(content);
+      if (parsed.length === 0) {
+        showToast(`Kon geen geldige tijdcodes vinden in ${droppedSrt.name}`, 'error');
+        return;
+      }
+      const lang = detectSrtLanguage(droppedSrt.name, parsed);
+      if (!droppedAudio && !audioFile) {
+        // Open the modal with the SRT pre-loaded or prompt for MP3
+        setIsOpenSrtMp3ModalOpen(true);
+        showToast(`SRT "${droppedSrt.name}" herkend! Kies nu nog het bijbehorende .MP3 bestand.`, 'info');
+        return;
+      }
+      await handleLoadSrtAndMp3({
+        audioFile: droppedAudio || audioFile,
+        cues: parsed,
+        srtFileName: droppedSrt.name,
+        language: lang,
+        runDoubleCheck: false,
+      });
+    };
+    reader.readAsText(droppedSrt);
+  };
+
   // Cue Editing Handlers
   const handleUpdateCue = (updatedCue: SubtitleCue) => {
     setCues((prev) =>
@@ -1026,6 +1147,7 @@ export default function App() {
         onStartNewSong={() => handleRequestStartNewSong(false)}
         onOpenMp4Converter={() => setIsMp4ModalOpen(true)}
         onOpenTimestampTransfer={() => setIsTimestampTransferOpen(true)}
+        onOpenSrtMp3={() => setIsOpenSrtMp3ModalOpen(true)}
       />
 
       {/* Main Container */}
@@ -1076,6 +1198,8 @@ export default function App() {
           onLoadDemoTrack={handleLoadDemoTrack}
           onOpenMp4Converter={() => setIsMp4ModalOpen(true)}
           onOpenTimestampTransfer={() => setIsTimestampTransferOpen(true)}
+          onOpenSrtMp3={() => setIsOpenSrtMp3ModalOpen(true)}
+          onDirectSrtMp3Drop={handleDirectSrtMp3Drop}
           vocalStartTime={vocalStartTime}
           onVocalStartTimeChange={setVocalStartTime}
           currentTime={currentTime}
@@ -1107,6 +1231,7 @@ export default function App() {
               onOpenExportModal={() => setIsExportModalOpen(true)}
               onOpenMp4Converter={() => setIsMp4ModalOpen(true)}
               onOpenTimestampTransfer={() => setIsTimestampTransferOpen(true)}
+              onOpenSrtMp3={() => setIsOpenSrtMp3ModalOpen(true)}
             />
           </div>
         )}
@@ -1233,6 +1358,16 @@ export default function App() {
         currentAudioName={audioName}
         currentAudioDuration={audioDuration}
         cues={cues}
+      />
+
+      {/* Open Existing .SRT + .MP3 Modal */}
+      <OpenSrtMp3Modal
+        isOpen={isOpenSrtMp3ModalOpen}
+        onClose={() => setIsOpenSrtMp3ModalOpen(false)}
+        currentAudioFile={audioFile}
+        currentAudioName={audioName}
+        currentAudioDuration={audioDuration}
+        onLoadSrtAndMp3={handleLoadSrtAndMp3}
       />
 
       {/* Timestamp Transfer to Another Language Modal */}

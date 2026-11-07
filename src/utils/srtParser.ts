@@ -74,33 +74,65 @@ export function parseSrtFile(srtContent: string): SubtitleCue[] {
     if (clean.length > 0) {
       cues.push({
         id: cueId,
-        startTime: Math.round(startTime * 100) / 100,
-        endTime: Math.round(Math.max(startTime + 0.5, endTime) * 100) / 100,
+        startTime: Math.round(startTime * 1000) / 1000,
+        endTime: Math.round(Math.max(startTime + 0.3, endTime) * 1000) / 1000,
         text: clean,
       });
       fallbackId = cueId + 1;
     }
   }
 
-  // Sort by id / startTime
-  return cues.sort((a, b) => a.startTime - b.startTime);
+  // Re-index sequentially by startTime so IDs are always clean 1..N
+  return cues
+    .sort((a, b) => a.startTime - b.startTime)
+    .map((c, idx) => ({ ...c, id: idx + 1 }));
 }
 
 /**
- * Parses timestamp string (00:01:23,456 or 00:01:23.456) into seconds
+ * Parses timestamp string (00:01:23,456 or 00:01:23.456 or 01:23.456) into seconds
  */
 export function parseSrtTimestampToSeconds(timeStr: string): number | null {
-  const clean = timeStr.trim().replace(',', '.');
-  const match = clean.match(/^(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})$/);
-  if (!match) {
-    // Try general parser
-    return parseTimeToSeconds(clean);
+  // Strip any WebVTT cue settings after the timestamp (e.g. "00:01:23.456 line:85%")
+  const firstToken = timeStr.trim().split(/\s+/)[0] || '';
+  const clean = firstToken.replace(',', '.');
+  const matchHMS = clean.match(/^(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})$/);
+  if (matchHMS) {
+    const hours = parseInt(matchHMS[1], 10);
+    const minutes = parseInt(matchHMS[2], 10);
+    const seconds = parseInt(matchHMS[3], 10);
+    const millis = parseInt(matchHMS[4].padEnd(3, '0').slice(0, 3), 10);
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000;
   }
 
-  const hours = parseInt(match[1], 10);
-  const minutes = parseInt(match[2], 10);
-  const seconds = parseInt(match[3], 10);
-  const millis = parseInt(match[4].padEnd(3, '0').slice(0, 3), 10);
+  const matchMS = clean.match(/^(\d{1,2}):(\d{2})[.,](\d{1,3})$/);
+  if (matchMS) {
+    const minutes = parseInt(matchMS[1], 10);
+    const seconds = parseInt(matchMS[2], 10);
+    const millis = parseInt(matchMS[3].padEnd(3, '0').slice(0, 3), 10);
+    return minutes * 60 + seconds + millis / 1000;
+  }
 
-  return hours * 3600 + minutes * 60 + seconds + millis / 1000;
+  return parseTimeToSeconds(clean);
+}
+
+/**
+ * Infers language ('nl' or 'en') from filename or subtitle text content
+ */
+export function detectSrtLanguage(fileName: string, cues: SubtitleCue[]): 'nl' | 'en' {
+  const lowerName = fileName.toLowerCase();
+  if (lowerName.includes('_nl.') || lowerName.includes('-nl.') || lowerName.includes('dutch') || lowerName.includes('nederlands')) {
+    return 'nl';
+  }
+  if (lowerName.includes('_en.') || lowerName.includes('-en.') || lowerName.includes('english') || lowerName.includes('engels')) {
+    return 'en';
+  }
+  // Heuristic check on common Dutch vs English words in the cues
+  const sampleText = ' ' + cues.slice(0, 12).map((c) => c.text.toLowerCase()).join(' ') + ' ';
+  const nlWords = [' de ', ' het ', ' een ', ' van ', ' en ', ' in ', ' op ', ' mijn ', ' niet ', ' met ', ' naar ', ' voor ', ' zijn '];
+  const enWords = [' the ', ' and ', ' in ', ' of ', ' my ', ' to ', ' with ', ' for ', ' from ', ' that ', ' this ', ' into '];
+  let nlScore = 0;
+  let enScore = 0;
+  for (const w of nlWords) if (sampleText.includes(w)) nlScore++;
+  for (const w of enWords) if (sampleText.includes(w)) enScore++;
+  return enScore > nlScore ? 'en' : 'nl';
 }

@@ -24,6 +24,7 @@ import {
   Activity,
   Zap,
   CheckCircle2,
+  FolderOpen,
 } from 'lucide-react';
 import { SubtitleCue } from '../types/subtitle';
 import { formatTimeDisplay, formatSecondsToSrt } from '../utils/timeFormat';
@@ -58,6 +59,7 @@ interface SubtitleEditStudioProps {
   onOpenExportModal?: () => void;
   onOpenMp4Converter?: () => void;
   onOpenTimestampTransfer?: () => void;
+  onOpenSrtMp3?: () => void;
   coverImageUrl?: string | null;
   onCoverImageChange?: (file: File) => void;
 }
@@ -85,6 +87,7 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
   onOpenExportModal,
   onOpenMp4Converter,
   onOpenTimestampTransfer,
+  onOpenSrtMp3,
   coverImageUrl: initialCoverImage,
   onCoverImageChange,
 }) => {
@@ -813,6 +816,18 @@ export const SubtitleEditStudio: React.FC<SubtitleEditStudioProps> = ({
 
         {/* Studio Quick Actions */}
         <div className="flex items-center gap-2 flex-wrap">
+          {onOpenSrtMp3 && (
+            <button
+              type="button"
+              onClick={onOpenSrtMp3}
+              className="px-2.5 py-1.5 bg-amber-950/80 hover:bg-amber-900 text-amber-200 hover:text-white border border-amber-500/40 rounded-lg font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+              title="Open een bestaand .SRT bestand met bijbehorende .MP3"
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+              <span>Open .SRT + .MP3</span>
+            </button>
+          )}
+
           {onOpenTimestampTransfer && (
             <button
               type="button"
